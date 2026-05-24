@@ -677,7 +677,7 @@ namespace XAU.ViewModels.Pages
         }
 
         [RelayCommand]
-        private async Task ToggleAutoUnlock()
+        private void ToggleAutoUnlock()
         {
             if (IsAutoUnlocking)
             {
@@ -713,7 +713,10 @@ namespace XAU.ViewModels.Pages
             _autoUnlockCts = new CancellationTokenSource();
             StartCountdownTimer();
 
-            await Task.Run(() => AutoUnlockLoop(queue, _autoUnlockCts.Token));
+            // Fire-and-forget so the RelayCommand returns immediately and the button stays enabled
+            // (allowing the user to click again to stop). Cancellation is handled via the CTS.
+            var token = _autoUnlockCts.Token;
+            _ = Task.Run(() => AutoUnlockLoop(queue, token));
         }
 
         private async Task AutoUnlockLoop(List<DGAchievement> queue, CancellationToken ct)
