@@ -29,6 +29,7 @@
             <Grid.RowDefinitions>
                 <RowDefinition Height="Auto" />
                 <RowDefinition Height="Auto" />
+                <RowDefinition Height="Auto" />
             </Grid.RowDefinitions>
             <Grid.ColumnDefinitions>
                 <ColumnDefinition Width="Auto" />
@@ -137,6 +138,64 @@
                 HorizontalAlignment="Stretch"
                 Command="{Binding ViewModel.RefreshAchievementsCommand}"
             />
+
+            <StackPanel
+                Grid.Row="2"
+                Grid.Column="0"
+                Grid.ColumnSpan="3"
+                Orientation="Horizontal"
+                HorizontalAlignment="Left"
+                VerticalAlignment="Center"
+                Margin="4,4,0,2">
+                <Label Content="Base (min):" VerticalAlignment="Center" Margin="0,0,4,0"/>
+                <ui:NumberBox
+                    IsEnabled="{Binding ViewModel.AutoUnlockConfigEnabled}"
+                    Minimum="0" Maximum="9999" SmallChange="1" LargeChange="10"
+                    Value="{Binding ViewModel.AutoUnlockBaseMinutes, Mode=TwoWay}"
+                    MinWidth="70" SpinButtonPlacementMode="Compact"
+                    ClearButtonEnabled="False" ValidationMode="InvalidInputOverwritten"/>
+                <Label Content="Min ±:" VerticalAlignment="Center" Margin="12,0,4,0"/>
+                <ui:NumberBox
+                    IsEnabled="{Binding ViewModel.AutoUnlockConfigEnabled}"
+                    Minimum="0" Maximum="999" SmallChange="1" LargeChange="5"
+                    Value="{Binding ViewModel.AutoUnlockMinRandom, Mode=TwoWay}"
+                    MinWidth="60" SpinButtonPlacementMode="Compact"
+                    ClearButtonEnabled="False" ValidationMode="InvalidInputOverwritten"/>
+                <Label Content="Max ±:" VerticalAlignment="Center" Margin="8,0,4,0"/>
+                <ui:NumberBox
+                    IsEnabled="{Binding ViewModel.AutoUnlockConfigEnabled}"
+                    Minimum="0" Maximum="999" SmallChange="1" LargeChange="5"
+                    Value="{Binding ViewModel.AutoUnlockMaxRandom, Mode=TwoWay}"
+                    MinWidth="60" SpinButtonPlacementMode="Compact"
+                    ClearButtonEnabled="False" ValidationMode="InvalidInputOverwritten"/>
+            </StackPanel>
+
+            <StackPanel
+                Grid.Row="2"
+                Grid.Column="3"
+                Orientation="Vertical"
+                HorizontalAlignment="Center"
+                VerticalAlignment="Center"
+                Margin="0,4,0,2">
+                <Label Content="Next unlock in:" HorizontalAlignment="Center" FontSize="10"
+                       Foreground="{ui:ThemeResource TextFillColorSecondaryBrush}" Padding="0"/>
+                <ui:TextBlock
+                    x:Name="CountdownText"
+                    Text="{Binding ViewModel.NextUnlockCountdown}"
+                    FontTypography="BodyStrong"
+                    HorizontalAlignment="Center" />
+            </StackPanel>
+
+            <ui:Button
+                Grid.Row="2"
+                Grid.Column="4"
+                x:Name="AutoUnlockButton"
+                IsEnabled="{Binding ViewModel.Unlockable}"
+                Padding="10,5,8,5"
+                Margin="10,4,5,2"
+                Content="{Binding ViewModel.AutoUnlockButtonText}"
+                HorizontalAlignment="Stretch"
+                Command="{Binding ViewModel.ToggleAutoUnlockCommand}" />
         </Grid>
         <DataGrid Grid.Row="1"  
                   VerticalScrollBarVisibility="Visible" 

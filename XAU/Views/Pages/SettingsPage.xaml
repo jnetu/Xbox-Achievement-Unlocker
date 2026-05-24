@@ -159,6 +159,48 @@
                     <ui:TextBlock
                         Grid.Row="0"
                         FontTypography="Body"
+                        Text="Auto Token Refresh"
+                        TextWrapping="WrapWithOverflow" />
+                    <ui:TextBlock
+                        Grid.Row="1"
+                        Foreground="{ui:ThemeResource TextFillColorSecondaryBrush}"
+                        Text="Automatically refreshes the XAUTH token before it expires (checked every 5 min). Prevents logouts caused by token expiration."
+                        TextWrapping="WrapWithOverflow" />
+                </Grid>
+            </ui:CardControl.Header>
+            <ui:ToggleSwitch Command="{Binding ViewModel.SaveSettingsCommand}" IsChecked="{Binding ViewModel.AutoTokenRefreshEnabled, Mode=TwoWay}" />
+        </ui:CardControl>
+        <ui:CardControl Margin="4,2">
+            <ui:CardControl.Header>
+                <Grid>
+                    <Grid.RowDefinitions>
+                        <RowDefinition Height="Auto" />
+                        <RowDefinition Height="Auto" />
+                    </Grid.RowDefinitions>
+                    <ui:TextBlock
+                        Grid.Row="0"
+                        FontTypography="Body"
+                        Text="Session Keep-Alive"
+                        TextWrapping="WrapWithOverflow" />
+                    <ui:TextBlock
+                        Grid.Row="1"
+                        Foreground="{ui:ThemeResource TextFillColorSecondaryBrush}"
+                        Text="Sends a light ping to Xbox Live every 20 min while the Spoofer is active to prevent the session from expiring on the server."
+                        TextWrapping="WrapWithOverflow" />
+                </Grid>
+            </ui:CardControl.Header>
+            <ui:ToggleSwitch Command="{Binding ViewModel.SaveSettingsCommand}" IsChecked="{Binding ViewModel.SessionKeepAliveEnabled, Mode=TwoWay}" />
+        </ui:CardControl>
+        <ui:CardControl Margin="4,2">
+            <ui:CardControl.Header>
+                <Grid>
+                    <Grid.RowDefinitions>
+                        <RowDefinition Height="Auto" />
+                        <RowDefinition Height="Auto" />
+                    </Grid.RowDefinitions>
+                    <ui:TextBlock
+                        Grid.Row="0"
+                        FontTypography="Body"
                         Text="Use Fake Signature"
                         TextWrapping="WrapWithOverflow" />
                     <ui:TextBlock

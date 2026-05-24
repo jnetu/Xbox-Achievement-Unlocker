@@ -15,4 +15,6 @@ public class XAUSettings
     public string? CachedEventsToken { get; set; }
     public DateTime? EventsTokenObtainedAt { get; set; }
     public string? EventsUserHash { get; set; }
+    public bool AutoTokenRefreshEnabled { get; set; }
+    public bool SessionKeepAliveEnabled { get; set; }
 }

@@ -92,6 +92,17 @@ namespace XAU.ViewModels.Pages
         Mem m = new Mem();
         public BackgroundWorker XauthWorker = new BackgroundWorker();
         public BackgroundWorker EventsTokenWorker = new BackgroundWorker();
+        public BackgroundWorker TokenRefreshWorker = new BackgroundWorker();
+        public BackgroundWorker SessionKeepAliveWorker = new BackgroundWorker();
+
+        private static readonly TimeSpan TokenRefreshCheckInterval = TimeSpan.FromMinutes(5);
+        private static readonly TimeSpan OAuthRefreshThreshold = TimeSpan.FromMinutes(30);
+        private static readonly TimeSpan KeepAliveInterval = TimeSpan.FromMinutes(20);
+
+        private DateTime _oauthTokenExpiresAt = DateTime.MaxValue;
+        private DateTime _lastKeepAliveAt = DateTime.MinValue;
+        private bool _tokenRefreshTriggeredEarly = false;
+
         bool IsAttached = false;
         bool GrabbedProfile = false;
         bool eventsTokenFound = false;
@@ -325,6 +336,8 @@ namespace XAU.ViewModels.Pages
             XauthWorker.WorkerReportsProgress = true;
             XauthWorker.RunWorkerAsync();
             EventsTokenWorker.DoWork += EventsTokenWorker_DoWork;
+            TokenRefreshWorker.DoWork += TokenRefreshWorker_DoWork;
+            SessionKeepAliveWorker.DoWork += SessionKeepAliveWorker_DoWork;
             if (!File.Exists(SettingsFilePath))
             {
                 if (!Directory.Exists(Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.MyDocuments),
@@ -349,7 +362,9 @@ namespace XAU.ViewModels.Pages
                     RegionOverride = false,
                     UseAcrylic = false,
                     PrivacyMode = false,
-                    OAuthLogin = false
+                    OAuthLogin = false,
+                    AutoTokenRefreshEnabled = true,
+                    SessionKeepAliveEnabled = true
                 };
                 string defaultSettingsJson = JsonConvert.SerializeObject(defaultSettings, Formatting.Indented);
                 using (var file = new StreamWriter(SettingsFilePath))
@@ -367,6 +382,10 @@ namespace XAU.ViewModels.Pages
             LoadSettings();
             if (Settings.OAuthLogin)
                 OAuthLogin();
+            if (Settings.AutoTokenRefreshEnabled && !TokenRefreshWorker.IsBusy)
+                TokenRefreshWorker.RunWorkerAsync();
+            if (Settings.SessionKeepAliveEnabled && !SessionKeepAliveWorker.IsBusy)
+                SessionKeepAliveWorker.RunWorkerAsync();
             _isInitialized = true;
             if (Settings.AutoLaunchXboxAppEnabled && Process.GetProcessesByName(ProcessNames.XboxPcApp).Length == 0)
             {
@@ -514,6 +533,11 @@ namespace XAU.ViewModels.Pages
                 // Start the events token worker to periodically check/refresh the token
                 if (Settings.AutoGrabEventsToken && !EventsTokenWorker.IsBusy)
                     EventsTokenWorker.RunWorkerAsync();
+
+                if (Settings.AutoTokenRefreshEnabled && !TokenRefreshWorker.IsBusy)
+                    TokenRefreshWorker.RunWorkerAsync();
+                if (Settings.SessionKeepAliveEnabled && !SessionKeepAliveWorker.IsBusy)
+                    SessionKeepAliveWorker.RunWorkerAsync();
             }
             catch (HttpRequestException ex)
             {
@@ -824,6 +848,121 @@ namespace XAU.ViewModels.Pages
                 : _eventsTokenObtainedAt + EventsTokenMaxAge;
         #endregion
 
+        #region SessionKeepAlive
+        public void TokenRefreshWorker_DoWork(object sender, DoWorkEventArgs e)
+        {
+            try
+            {
+                TokenRefreshWorkerLoop();
+            }
+            catch { }
+        }
+
+        private void TokenRefreshWorkerLoop()
+        {
+            while (!IsLoggedIn)
+                Thread.Sleep(2000);
+
+            while (true)
+            {
+                Thread.Sleep(TokenRefreshCheckInterval);
+
+                if (!Settings.AutoTokenRefreshEnabled || !IsLoggedIn)
+                    continue;
+
+                try
+                {
+                    if (Settings.OAuthLogin)
+                        TryRefreshOAuthTokenAsync().GetAwaiter().GetResult();
+                    else
+                        ProbeSessionAliveAsync().GetAwaiter().GetResult();
+                }
+                catch { }
+
+                _tokenRefreshTriggeredEarly = false;
+            }
+        }
+
+        private async Task TryRefreshOAuthTokenAsync()
+        {
+            if (!_tokenRefreshTriggeredEarly && DateTime.UtcNow < _oauthTokenExpiresAt - OAuthRefreshThreshold)
+                return;
+
+            try
+            {
+                var session = readSession();
+                if (session?.RefreshToken == null)
+                    return;
+                var response = await oauth.AuthenticateSilently(session.RefreshToken);
+                System.Windows.Application.Current.Dispatcher.Invoke(() =>
+                {
+                    CompleteLogin(response);
+                    _snackbarService.Show("Session", "Token renewed automatically", ControlAppearance.Success, new SymbolIcon(SymbolRegular.Checkmark24), _snackbarDuration);
+                });
+            }
+            catch
+            {
+                System.Windows.Application.Current.Dispatcher.Invoke(() =>
+                {
+                    IsLoggedIn = false;
+                    _snackbarService.Show("Session expired", "Please log in again", ControlAppearance.Danger, new SymbolIcon(SymbolRegular.ErrorCircle24), _snackbarDuration);
+                });
+            }
+        }
+
+        private async Task ProbeSessionAliveAsync()
+        {
+            try
+            {
+                await new XboxRestAPI(XAUTH).GetBasicProfileAsync();
+            }
+            catch (HttpRequestException ex) when (ex.StatusCode == HttpStatusCode.Unauthorized)
+            {
+                System.Windows.Application.Current.Dispatcher.Invoke(() =>
+                {
+                    IsLoggedIn = false;
+                    XAUTHTested = false;
+                    XAUTH = "";
+                });
+            }
+            catch { }
+        }
+
+        public void SessionKeepAliveWorker_DoWork(object sender, DoWorkEventArgs e)
+        {
+            try
+            {
+                SessionKeepAliveWorkerLoop();
+            }
+            catch { }
+        }
+
+        private void SessionKeepAliveWorkerLoop()
+        {
+            while (!IsLoggedIn)
+                Thread.Sleep(2000);
+
+            while (true)
+            {
+                Thread.Sleep(KeepAliveInterval);
+
+                if (!Settings.SessionKeepAliveEnabled || !IsLoggedIn || SpoofingStatus == 0)
+                    continue;
+
+                try
+                {
+                    new XboxRestAPI(XAUTH).GetBasicProfileAsync().GetAwaiter().GetResult();
+                    _lastKeepAliveAt = DateTime.UtcNow;
+                }
+                catch (HttpRequestException ex) when (ex.StatusCode == HttpStatusCode.Unauthorized)
+                {
+                    _tokenRefreshTriggeredEarly = true;
+                }
+                catch { }
+            }
+        }
+        #endregion
+
         #region OAuthLogin
 
         [RelayCommand]
@@ -933,6 +1072,11 @@ namespace XAU.ViewModels.Pages
             try
             {
                 XAUTH = $"XBL3.0 x={sisuResult.AuthorizationToken.XuiClaims.UserHash};{sisuResult.AuthorizationToken.Token}";
+                if (!string.IsNullOrEmpty(sisuResult.AuthorizationToken.ExpireOn)
+                    && DateTime.TryParse(sisuResult.AuthorizationToken.ExpireOn, out var expiresAt))
+                    _oauthTokenExpiresAt = expiresAt.ToUniversalTime();
+                else
+                    _oauthTokenExpiresAt = DateTime.UtcNow.AddHours(23);
                 var xui = sisuResult.AuthorizationToken.XuiClaims;
                 XUIDOnly = xui?.XboxUserId ?? "";
                 if (!string.IsNullOrEmpty(XUIDOnly))
@@ -964,6 +1108,11 @@ namespace XAU.ViewModels.Pages
             // Start the events token worker to periodically check/refresh the token
             if (Settings.AutoGrabEventsToken && !EventsTokenWorker.IsBusy)
                 EventsTokenWorker.RunWorkerAsync();
+
+            if (Settings.AutoTokenRefreshEnabled && !TokenRefreshWorker.IsBusy)
+                TokenRefreshWorker.RunWorkerAsync();
+            if (Settings.SessionKeepAliveEnabled && !SessionKeepAliveWorker.IsBusy)
+                SessionKeepAliveWorker.RunWorkerAsync();
         }
         private void ClearProfileState()
         {
@@ -1182,6 +1331,8 @@ namespace XAU.ViewModels.Pages
             Settings.CachedEventsToken = settings.CachedEventsToken;
             Settings.EventsTokenObtainedAt = settings.EventsTokenObtainedAt;
             Settings.EventsUserHash = settings.EventsUserHash;
+            Settings.AutoTokenRefreshEnabled = settings.AutoTokenRefreshEnabled;
+            Settings.SessionKeepAliveEnabled = settings.SessionKeepAliveEnabled;
             _eventsUserHash = settings.EventsUserHash;
 
             // Restore cached events token if it's still fresh

@@ -4,6 +4,7 @@ using System.IO;
 using System.Net.Http;
 using System.Text;
 using System.Windows.Data;
+using System.Windows.Threading;
 using Newtonsoft.Json;
 using Newtonsoft.Json.Linq;
 using Wpf.Ui.Controls;
@@ -26,6 +27,24 @@ namespace XAU.ViewModels.Pages
         [ObservableProperty] private string _gameName = "";
         [ObservableProperty] private bool _isUnlockAllEnabled = false;
         [ObservableProperty] private string _searchText = "";
+
+        // --- Auto-Unlock State ---
+        [ObservableProperty] private bool _isAutoUnlocking = false;
+        [ObservableProperty] private string _autoUnlockButtonText = "Auto-Unlock";
+        [ObservableProperty] private string _nextUnlockCountdown = "---, --:--:--";
+        [ObservableProperty] private bool _autoUnlockConfigEnabled = true;
+
+        // --- Auto-Unlock Timer Config ---
+        [ObservableProperty] private int _autoUnlockBaseMinutes = 60;
+        [ObservableProperty] private int _autoUnlockMinRandom = 0;
+        [ObservableProperty] private int _autoUnlockMaxRandom = 0;
+
+        // --- Auto-Unlock Internals ---
+        private CancellationTokenSource? _autoUnlockCts;
+        private DateTime _nextUnlockAt = DateTime.MinValue;
+        private DispatcherTimer? _countdownTimer;
+        private readonly Random _rng = new Random();
+
         public static string TitleID = "0";
         private bool IsTitleIDValid = false;
         public static bool NewGame = false;
@@ -655,6 +674,117 @@ namespace XAU.ViewModels.Pages
                                         $"{hre.Message}", ControlAppearance.Danger,
                                         new SymbolIcon(SymbolRegular.ErrorCircle24), _snackbarDuration);
             }
+        }
+
+        [RelayCommand]
+        private async Task ToggleAutoUnlock()
+        {
+            if (IsAutoUnlocking)
+            {
+                _autoUnlockCts?.Cancel();
+                _countdownTimer?.Stop();
+                IsAutoUnlocking = false;
+                AutoUnlockButtonText = "Auto-Unlock";
+                NextUnlockCountdown = "---, --:--:--";
+                AutoUnlockConfigEnabled = true;
+                return;
+            }
+
+            var queue = DGAchievements
+                .Where(a => a.IsUnlockable)
+                .OrderByDescending(a => a.RarityPercentage)
+                .ToList();
+
+            if (!queue.Any())
+            {
+                _snackbarService.Show("Auto-Unlock", "No unlockable achievements found.",
+                    ControlAppearance.Caution, new SymbolIcon(SymbolRegular.Warning24), _snackbarDuration);
+                return;
+            }
+
+            var sorted = DGAchievements.OrderByDescending(a => a.RarityPercentage).ToList();
+            DGAchievements.Clear();
+            foreach (var a in sorted) DGAchievements.Add(a);
+
+            IsAutoUnlocking = true;
+            AutoUnlockButtonText = "Stop Auto-Unlock";
+            AutoUnlockConfigEnabled = false;
+
+            _autoUnlockCts = new CancellationTokenSource();
+            StartCountdownTimer();
+
+            await Task.Run(() => AutoUnlockLoop(queue, _autoUnlockCts.Token));
+        }
+
+        private async Task AutoUnlockLoop(List<DGAchievement> queue, CancellationToken ct)
+        {
+            foreach (var achievement in queue)
+            {
+                if (ct.IsCancellationRequested) break;
+
+                int min = AutoUnlockMinRandom;
+                int max = AutoUnlockMaxRandom;
+                if (min > max) (min, max) = (max, min);
+
+                int offsetMinutes = _rng.Next(min, max + 1);
+                int sign = _rng.Next(0, 2) == 0 ? 1 : -1;
+                int totalMinutes = Math.Max(1, AutoUnlockBaseMinutes + sign * offsetMinutes);
+
+                _nextUnlockAt = DateTime.Now.AddMinutes(totalMinutes);
+
+                while (DateTime.Now < _nextUnlockAt)
+                {
+                    if (ct.IsCancellationRequested) return;
+                    try { await Task.Delay(1000, ct); }
+                    catch (TaskCanceledException) { return; }
+                }
+
+                if (ct.IsCancellationRequested) break;
+
+                System.Windows.Application.Current.Dispatcher.Invoke(() =>
+                {
+                    int index = DGAchievements.IndexOf(achievement);
+                    if (index >= 0 && DGAchievements[index].IsUnlockable)
+                        UnlockAchievement(index);
+                });
+            }
+
+            System.Windows.Application.Current.Dispatcher.Invoke(() =>
+            {
+                IsAutoUnlocking = false;
+                AutoUnlockButtonText = "Auto-Unlock";
+                AutoUnlockConfigEnabled = true;
+                _countdownTimer?.Stop();
+                NextUnlockCountdown = "---, --:--:--";
+                if (!ct.IsCancellationRequested)
+                {
+                    _snackbarService.Show("Auto-Unlock Complete",
+                        "All unlockable achievements have been unlocked.",
+                        ControlAppearance.Success, new SymbolIcon(SymbolRegular.Checkmark24), _snackbarDuration);
+                }
+            });
+        }
+
+        private void StartCountdownTimer()
+        {
+            _countdownTimer?.Stop();
+            _countdownTimer = new DispatcherTimer { Interval = TimeSpan.FromSeconds(1) };
+            _countdownTimer.Tick += (s, e) =>
+            {
+                if (_nextUnlockAt == DateTime.MinValue || !IsAutoUnlocking)
+                {
+                    NextUnlockCountdown = "---, --:--:--";
+                    return;
+                }
+                var remaining = _nextUnlockAt - DateTime.Now;
+                if (remaining <= TimeSpan.Zero)
+                {
+                    NextUnlockCountdown = "0, 00:00:00";
+                    return;
+                }
+                NextUnlockCountdown = $"{(int)remaining.TotalDays}, {remaining.Hours:D2}:{remaining.Minutes:D2}:{remaining.Seconds:D2}";
+            };
+            _countdownTimer.Start();
         }
 
         [RelayCommand]
