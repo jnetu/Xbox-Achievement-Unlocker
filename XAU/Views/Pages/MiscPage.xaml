@@ -360,6 +360,143 @@
                     </StackPanel>
                 </Grid>
             </TabItem>
+
+            <TabItem>
+                <TabItem.Header>
+                    <StackPanel Orientation="Horizontal">
+                        <ui:SymbolIcon Margin="0,0,6,0" Symbol="TabletSpeaker24" />
+                        <TextBlock Text="Multi-Spoofer" />
+                    </StackPanel>
+                </TabItem.Header>
+                <Grid Margin="15">
+                    <Grid.RowDefinitions>
+                        <RowDefinition Height="Auto" />
+                        <RowDefinition Height="*" />
+                    </Grid.RowDefinitions>
+
+                    <Border
+                        Grid.Row="0"
+                        Margin="0,0,0,15"
+                        Background="{DynamicResource ControlFillColorDefaultBrush}"
+                        BorderBrush="{DynamicResource ControlElevationBorderBrush}"
+                        BorderThickness="1"
+                        CornerRadius="8">
+                        <Grid Margin="20">
+                            <Grid.RowDefinitions>
+                                <RowDefinition Height="Auto" />
+                                <RowDefinition Height="Auto" />
+                            </Grid.RowDefinitions>
+                            <Grid.ColumnDefinitions>
+                                <ColumnDefinition Width="*" />
+                                <ColumnDefinition Width="Auto" />
+                            </Grid.ColumnDefinitions>
+
+                            <TextBlock
+                                Grid.Row="0"
+                                Grid.Column="0"
+                                Grid.ColumnSpan="2"
+                                Margin="0,0,0,10"
+                                FontSize="14"
+                                FontWeight="SemiBold"
+                                Foreground="{DynamicResource TextFillColorPrimaryBrush}"
+                                Text="{Binding ViewModel.MultiSpoofingStatusText}" />
+
+                            <ui:TextBox
+                                Grid.Row="1"
+                                Grid.Column="0"
+                                Margin="0,0,15,0"
+                                FontSize="14"
+                                PlaceholderText="Title IDs separated by comma (e.g. 219630713, 1144039928)"
+                                Text="{Binding ViewModel.MultiSpoofingIDs, Mode=TwoWay, UpdateSourceTrigger=PropertyChanged}" />
+
+                            <ui:Button
+                                Grid.Row="1"
+                                Grid.Column="1"
+                                MinWidth="170"
+                                Command="{Binding ViewModel.MultiSpooferButtonClickedCommand}"
+                                Content="{Binding ViewModel.MultiSpoofingButtonText}"
+                                Icon="{ui:SymbolIcon TabletSpeaker24}"
+                                IsEnabled="{Binding ViewModel.IsInitialized}" />
+                        </Grid>
+                    </Border>
+
+                    <ScrollViewer Grid.Row="1" VerticalScrollBarVisibility="Auto">
+                        <ItemsControl ItemsSource="{Binding ViewModel.MultiSpoofGames}">
+                            <ItemsControl.ItemTemplate>
+                                <DataTemplate>
+                                    <Border
+                                        Margin="0,0,0,10"
+                                        Padding="15"
+                                        Background="{DynamicResource ControlFillColorDefaultBrush}"
+                                        BorderBrush="{DynamicResource ControlElevationBorderBrush}"
+                                        BorderThickness="1"
+                                        CornerRadius="8">
+                                        <Grid>
+                                            <Grid.ColumnDefinitions>
+                                                <ColumnDefinition Width="Auto" />
+                                                <ColumnDefinition Width="*" />
+                                                <ColumnDefinition Width="Auto" />
+                                            </Grid.ColumnDefinitions>
+
+                                            <ui:Image
+                                                Grid.Column="0"
+                                                Width="80"
+                                                Height="80"
+                                                Margin="0,0,15,0"
+                                                VerticalAlignment="Center"
+                                                Source="{Binding ImageUrl}" />
+
+                                            <StackPanel Grid.Column="1" VerticalAlignment="Center">
+                                                <TextBlock
+                                                    FontSize="14"
+                                                    FontWeight="SemiBold"
+                                                    Foreground="{DynamicResource TextFillColorPrimaryBrush}"
+                                                    Text="{Binding Name}"
+                                                    TextWrapping="Wrap" />
+                                                <TextBlock
+                                                    Margin="0,4,0,0"
+                                                    FontSize="12"
+                                                    Foreground="{DynamicResource TextFillColorSecondaryBrush}"
+                                                    Text="{Binding TitleId, StringFormat='Title ID: {0}'}" />
+                                                <TextBlock
+                                                    Margin="0,2,0,0"
+                                                    FontSize="12"
+                                                    Foreground="{DynamicResource TextFillColorSecondaryBrush}"
+                                                    Text="{Binding Gamerscore, StringFormat='Gamerscore: {0}'}" />
+                                                <TextBlock
+                                                    Margin="0,2,0,0"
+                                                    FontSize="12"
+                                                    Foreground="{DynamicResource TextFillColorSecondaryBrush}"
+                                                    Text="{Binding TimePlayed, StringFormat='Time Played: {0}'}" />
+                                            </StackPanel>
+
+                                            <StackPanel
+                                                Grid.Column="2"
+                                                Margin="15,0,0,0"
+                                                HorizontalAlignment="Right"
+                                                VerticalAlignment="Center">
+                                                <TextBlock
+                                                    HorizontalAlignment="Right"
+                                                    FontSize="12"
+                                                    FontWeight="Medium"
+                                                    Foreground="{DynamicResource TextFillColorSecondaryBrush}"
+                                                    Text="Spoofing Duration" />
+                                                <TextBlock
+                                                    Margin="0,4,0,0"
+                                                    HorizontalAlignment="Right"
+                                                    FontSize="18"
+                                                    FontWeight="SemiBold"
+                                                    Foreground="{DynamicResource TextFillColorPrimaryBrush}"
+                                                    Text="{Binding SpoofingDuration}" />
+                                            </StackPanel>
+                                        </Grid>
+                                    </Border>
+                                </DataTemplate>
+                            </ItemsControl.ItemTemplate>
+                        </ItemsControl>
+                    </ScrollViewer>
+                </Grid>
+            </TabItem>
         </TabControl>
 
     </Grid>

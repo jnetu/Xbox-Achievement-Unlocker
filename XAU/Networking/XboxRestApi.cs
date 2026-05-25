@@ -244,6 +244,35 @@ public class XboxRestAPI
         new StringContent(JsonConvert.SerializeObject(heartbeatRequest), Encoding.UTF8, HeaderValues.Accept));
     }
 
+    public async Task SendHeartbeatAsync(string xuid, IEnumerable<string> titleIds)
+    {
+        if (string.IsNullOrWhiteSpace(xuid) || titleIds == null)
+        {
+            // Don't send a request if we don't have the details
+            return;
+        }
+
+        var titlesList = titleIds
+            .Where(id => !string.IsNullOrWhiteSpace(id))
+            .Select(id => new TitleRequest { id = id })
+            .ToList();
+
+        if (titlesList.Count == 0)
+        {
+            return;
+        }
+
+        SetDefaultSpooferHeaders();
+        _spooferClient.DefaultRequestHeaders.Add(HeaderNames.ContractVersion, HeaderValues.ContractVersion3);
+        var heartbeatRequest = new HeartbeatRequest()
+        {
+            titles = titlesList
+        };
+        await _spooferClient.PostAsync(
+            string.Format(InterpolatedXboxAPIUrls.HeartbeatUrl, xuid),
+            new StringContent(JsonConvert.SerializeObject(heartbeatRequest), Encoding.UTF8, HeaderValues.Accept));
+    }
+
     public async Task StopHeartbeatAsync(string xuid)
     {
         if (string.IsNullOrWhiteSpace(xuid))

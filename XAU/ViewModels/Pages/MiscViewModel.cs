@@ -1,6 +1,7 @@
 using HtmlAgilityPack;
 using Microsoft.Data.Sqlite;
 using Newtonsoft.Json.Linq;
+using System.Collections.ObjectModel;
 using System.Data;
 using System.Diagnostics;
 using System.DirectoryServices;
@@ -190,6 +191,160 @@ namespace XAU.ViewModels.Pages
                     }
                     spoofingTime = stopwatch.Elapsed;
                     SpoofingText = $"Spoofing {GameInfoResponse.Titles[0].Name} For: {spoofingTime.ToString(@"hh\:mm\:ss")}";
+                    i++;
+                }
+                Thread.Sleep(1000);
+            }
+        }
+
+        #endregion
+
+        #region MultiSpoofer
+
+        [ObservableProperty] private string _multiSpoofingIDs = "";
+        [ObservableProperty] private string _multiSpoofingButtonText = "Start Multi-Spoof";
+        [ObservableProperty] private string _multiSpoofingStatusText = "Multi-Spoofing Not Started";
+        [ObservableProperty] private ObservableCollection<MultiSpoofGameItem> _multiSpoofGames = new();
+        private bool _multiCurrentlySpoofing = false;
+        private bool _multiSpoofingUpdate = false;
+        private Lazy<XboxRestAPI> _multiXboxRestAPI = new Lazy<XboxRestAPI>(() => new XboxRestAPI(HomeViewModel.XAUTH));
+
+        [RelayCommand]
+        public async Task MultiSpooferButtonClicked()
+        {
+            if (_multiCurrentlySpoofing)
+            {
+                _multiSpoofingUpdate = true;
+                _multiCurrentlySpoofing = false;
+                MultiSpoofingButtonText = "Start Multi-Spoof";
+                MultiSpoofingStatusText = "Multi-Spoofing Not Started";
+                System.Windows.Application.Current.Dispatcher.Invoke(() => MultiSpoofGames.Clear());
+                await _multiXboxRestAPI.Value.StopHeartbeatAsync(HomeViewModel.XUIDOnly);
+                return;
+            }
+
+            var ids = (MultiSpoofingIDs ?? string.Empty)
+                .Split(',')
+                .Select(s => s.Trim())
+                .Where(s => !string.IsNullOrWhiteSpace(s))
+                .Distinct()
+                .ToList();
+
+            if (ids.Count == 0)
+            {
+                _snackbarService.Show("Error", "Please enter one or more Title IDs separated by commas.",
+                    ControlAppearance.Danger,
+                    new SymbolIcon(SymbolRegular.ErrorCircle24), _snackbarDuration);
+                return;
+            }
+
+            System.Windows.Application.Current.Dispatcher.Invoke(() => MultiSpoofGames.Clear());
+            MultiSpoofingStatusText = $"Loading {ids.Count} title(s)...";
+
+            await LoadMultiSpoofGamesAsync(ids);
+
+            if (MultiSpoofGames.Count == 0)
+            {
+                MultiSpoofingStatusText = "Multi-Spoofing Not Started";
+                return;
+            }
+
+            var validIds = MultiSpoofGames.Select(g => g.TitleId).ToList();
+            _multiCurrentlySpoofing = true;
+            _multiSpoofingUpdate = false;
+            MultiSpoofingButtonText = "Stop Multi-Spoof";
+            MultiSpoofingStatusText = $"Multi-Spoofing {validIds.Count} title(s)";
+
+            _ = Task.Run(() => MultiSpoofingLoop(validIds));
+        }
+
+        private async Task LoadMultiSpoofGamesAsync(List<string> titleIds)
+        {
+            var failedIds = new List<string>();
+            var lockObj = new object();
+
+            var tasks = titleIds.Select(async id =>
+            {
+                try
+                {
+                    var gameInfo = await _multiXboxRestAPI.Value.GetGameTitleAsync(HomeViewModel.XUIDOnly, id);
+                    var gameStats = await _multiXboxRestAPI.Value.GetGameStatsAsync(HomeViewModel.XUIDOnly, id);
+
+                    if (gameInfo == null || gameStats == null || gameInfo.Titles == null || !gameInfo.Titles.Any())
+                    {
+                        lock (lockObj) failedIds.Add(id);
+                        return;
+                    }
+
+                    var title = gameInfo.Titles[0];
+
+                    string gamerscore = $"{title.Achievement?.CurrentGamerscore ?? 0}/{title.Achievement?.TotalGamerscore ?? 0}";
+
+                    string timePlayed;
+                    try
+                    {
+                        var t = TimeSpan.FromMinutes(Convert.ToDouble(gameStats.StatListsCollection[0].Stats[0].Value));
+                        timePlayed = $"{t.Days} Days, {t.Hours} Hours and {t.Minutes} minutes";
+                    }
+                    catch
+                    {
+                        timePlayed = "Unknown";
+                    }
+
+                    var item = new MultiSpoofGameItem
+                    {
+                        TitleId = title.TitleId ?? id,
+                        Name = title.Name,
+                        ImageUrl = !string.IsNullOrEmpty(title.DisplayImage) ? title.DisplayImage : "pack://application:,,,/Assets/cirno.png",
+                        Gamerscore = gamerscore,
+                        TimePlayed = timePlayed
+                    };
+
+                    System.Windows.Application.Current.Dispatcher.Invoke(() => MultiSpoofGames.Add(item));
+                }
+                catch
+                {
+                    lock (lockObj) failedIds.Add(id);
+                }
+            }).ToList();
+
+            await Task.WhenAll(tasks);
+
+            if (failedIds.Count > 0)
+            {
+                _snackbarService.Show("Some Title IDs failed",
+                    $"Could not load info for: {string.Join(", ", failedIds)}",
+                    ControlAppearance.Caution,
+                    new SymbolIcon(SymbolRegular.Warning24), _snackbarDuration);
+            }
+        }
+
+        private async Task MultiSpoofingLoop(List<string> titleIds)
+        {
+            var stopwatch = Stopwatch.StartNew();
+            await _multiXboxRestAPI.Value.SendHeartbeatAsync(HomeViewModel.XUIDOnly, titleIds);
+            int i = 0;
+            _multiSpoofingUpdate = false;
+            Thread.Sleep(1000);
+            while (!_multiSpoofingUpdate)
+            {
+                if (i == 300)
+                {
+                    await _multiXboxRestAPI.Value.SendHeartbeatAsync(HomeViewModel.XUIDOnly, titleIds);
+                    i = 0;
+                }
+                else
+                {
+                    if (_multiSpoofingUpdate) break;
+
+                    var elapsed = stopwatch.Elapsed.ToString(@"hh\:mm\:ss");
+                    System.Windows.Application.Current.Dispatcher.Invoke(() =>
+                    {
+                        foreach (var item in MultiSpoofGames)
+                        {
+                            item.SpoofingDuration = elapsed;
+                        }
+                    });
                     i++;
                 }
                 Thread.Sleep(1000);
