@@ -37,6 +37,8 @@ public partial class App
             services.AddSingleton<StatsViewModel>();
             services.AddSingleton<MiscPage>();
             services.AddSingleton<MiscViewModel>();
+            services.AddSingleton<ScannerPage>();
+            services.AddSingleton<ScannerViewModel>();
             services.AddSingleton<InfoPage>();
             services.AddSingleton<InfoViewModel>();
             services.AddSingleton<DebugPage>();

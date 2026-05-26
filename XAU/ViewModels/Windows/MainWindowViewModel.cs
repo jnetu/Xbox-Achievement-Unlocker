@@ -78,6 +78,12 @@ namespace XAU.ViewModels.Windows
                 Content = "Misc",
                 Icon = new SymbolIcon { Symbol = SymbolRegular.MoreCircle24 },
                 TargetPageType = typeof(Views.Pages.MiscPage)
+            },
+            new NavigationViewItem()
+            {
+                Content = "Scanner",
+                Icon = new SymbolIcon { Symbol = SymbolRegular.PersonSearch24 },
+                TargetPageType = typeof(Views.Pages.ScannerPage)
             }
             #if DEBUG
             ,
