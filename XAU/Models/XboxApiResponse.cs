@@ -139,6 +139,14 @@ public class Detail
     public int FollowingCount { get; set; }
     public bool HasGamePass { get; set; }
     public List<string>? Genres { get; set; }
+
+    // Catches title-detail fields the API returns that this class doesn't
+    // model explicitly (description, developerName, publisherName,
+    // releaseDate, shortDescription, minAge, attributes, availabilities,
+    // capabilities, vuiDisplayName, xboxLiveGoldRequired). Used by
+    // ScannerViewModel — harmless for callers that ignore it.
+    [Newtonsoft.Json.JsonExtensionData]
+    public IDictionary<string, Newtonsoft.Json.Linq.JToken>? ExtensionData { get; set; }
 }
 
 public class LinkedAccount
@@ -301,6 +309,10 @@ public class Title
 
     public string? XboxLiveTier { get; set; }
 
+    // Catches any field the API returns that we don't model explicitly
+    // (e.g. isStreamable, productId, etc.). Used by ScannerViewModel.
+    [Newtonsoft.Json.JsonExtensionData]
+    public IDictionary<string, Newtonsoft.Json.Linq.JToken>? ExtensionData { get; set; }
 }
 
 public class TitlesList
