@@ -147,26 +147,19 @@
                 HorizontalAlignment="Left"
                 VerticalAlignment="Center"
                 Margin="4,4,0,2">
-                <Label Content="Base (min):" VerticalAlignment="Center" Margin="0,0,4,0"/>
+                <Label Content="Min (min):" VerticalAlignment="Center" Margin="0,0,4,0"/>
                 <ui:NumberBox
                     IsEnabled="{Binding ViewModel.AutoUnlockConfigEnabled}"
-                    Minimum="0" Maximum="9999" SmallChange="1" LargeChange="10"
-                    Value="{Binding ViewModel.AutoUnlockBaseMinutes, Mode=TwoWay}"
+                    Minimum="1" Maximum="9999" SmallChange="1" LargeChange="10"
+                    Value="{Binding ViewModel.AutoUnlockMinMinutes, Mode=TwoWay}"
                     MinWidth="70" SpinButtonPlacementMode="Compact"
                     ClearButtonEnabled="False" ValidationMode="InvalidInputOverwritten"/>
-                <Label Content="Min ±:" VerticalAlignment="Center" Margin="12,0,4,0"/>
+                <Label Content="Max (min):" VerticalAlignment="Center" Margin="12,0,4,0"/>
                 <ui:NumberBox
                     IsEnabled="{Binding ViewModel.AutoUnlockConfigEnabled}"
-                    Minimum="0" Maximum="999" SmallChange="1" LargeChange="5"
-                    Value="{Binding ViewModel.AutoUnlockMinRandom, Mode=TwoWay}"
-                    MinWidth="60" SpinButtonPlacementMode="Compact"
-                    ClearButtonEnabled="False" ValidationMode="InvalidInputOverwritten"/>
-                <Label Content="Max ±:" VerticalAlignment="Center" Margin="8,0,4,0"/>
-                <ui:NumberBox
-                    IsEnabled="{Binding ViewModel.AutoUnlockConfigEnabled}"
-                    Minimum="0" Maximum="999" SmallChange="1" LargeChange="5"
-                    Value="{Binding ViewModel.AutoUnlockMaxRandom, Mode=TwoWay}"
-                    MinWidth="60" SpinButtonPlacementMode="Compact"
+                    Minimum="1" Maximum="9999" SmallChange="1" LargeChange="10"
+                    Value="{Binding ViewModel.AutoUnlockMaxMinutes, Mode=TwoWay}"
+                    MinWidth="70" SpinButtonPlacementMode="Compact"
                     ClearButtonEnabled="False" ValidationMode="InvalidInputOverwritten"/>
             </StackPanel>
 

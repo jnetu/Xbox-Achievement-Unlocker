@@ -35,9 +35,8 @@ namespace XAU.ViewModels.Pages
         [ObservableProperty] private bool _autoUnlockConfigEnabled = true;
 
         // --- Auto-Unlock Timer Config ---
-        [ObservableProperty] private int _autoUnlockBaseMinutes = 60;
-        [ObservableProperty] private int _autoUnlockMinRandom = 0;
-        [ObservableProperty] private int _autoUnlockMaxRandom = 0;
+        [ObservableProperty] private int _autoUnlockMinMinutes = 60;
+        [ObservableProperty] private int _autoUnlockMaxMinutes = 120;
 
         // --- Auto-Unlock Internals ---
         private CancellationTokenSource? _autoUnlockCts;
@@ -725,13 +724,12 @@ namespace XAU.ViewModels.Pages
             {
                 if (ct.IsCancellationRequested) break;
 
-                int min = AutoUnlockMinRandom;
-                int max = AutoUnlockMaxRandom;
-                if (min > max) (min, max) = (max, min);
-
-                int offsetMinutes = _rng.Next(min, max + 1);
-                int sign = _rng.Next(0, 2) == 0 ? 1 : -1;
-                int totalMinutes = Math.Max(1, AutoUnlockBaseMinutes + sign * offsetMinutes);
+                int minM = AutoUnlockMinMinutes;
+                int maxM = AutoUnlockMaxMinutes;
+                if (minM > maxM) (minM, maxM) = (maxM, minM);
+                minM = Math.Max(1, minM);
+                maxM = Math.Max(1, maxM);
+                int totalMinutes = _rng.Next(minM, maxM + 1);
 
                 _nextUnlockAt = DateTime.Now.AddMinutes(totalMinutes);
 
