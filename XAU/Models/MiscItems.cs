@@ -15,4 +15,7 @@
         public string TimePlayed { get; set; }
 
         [ObservableProperty] private string _spoofingDuration = "00:00:00";
+
+        // Delta de horas jogadas da ultima sessao de multi-spoof (ex.: "+12 min" ou "sem aumento").
+        [ObservableProperty] private string _lastSessionDelta = "";
     }

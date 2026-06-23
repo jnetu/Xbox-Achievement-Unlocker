@@ -125,6 +125,30 @@ namespace XAU.ViewModels.Pages
         }
         public void OnNavigatedFrom() { }
 
+        // Dispara a auto-retomada silenciosa do Multi-Spoofer / Auto-Unlock apos o login concluir
+        // (InitComplete=true e XUIDOnly disponivel). Idempotente; marshalado para a UI thread.
+        private static bool _autoResumeFired = false;
+        private void TriggerAutoResume()
+        {
+            if (_autoResumeFired) return;
+            _autoResumeFired = true;
+            System.Windows.Application.Current?.Dispatcher.InvokeAsync(async () =>
+            {
+                try
+                {
+                    var misc = App.GetService<MiscViewModel>();
+                    if (misc != null) await misc.TryAutoResumeMultiSpoof();
+                }
+                catch { /* retomada nao pode quebrar o login */ }
+                try
+                {
+                    var achievements = App.GetService<AchievementsViewModel>();
+                    if (achievements != null) await achievements.TryAutoResumeAutoUnlock();
+                }
+                catch { /* retomada nao pode quebrar o login */ }
+            });
+        }
+
         #region Update
         private async Task CheckForToolUpdates()
         {
@@ -538,6 +562,8 @@ namespace XAU.ViewModels.Pages
                     TokenRefreshWorker.RunWorkerAsync();
                 if (Settings.SessionKeepAliveEnabled && !SessionKeepAliveWorker.IsBusy)
                     SessionKeepAliveWorker.RunWorkerAsync();
+
+                TriggerAutoResume();
             }
             catch (HttpRequestException ex)
             {
@@ -1084,6 +1110,7 @@ namespace XAU.ViewModels.Pages
                     IsLoggedIn = true;
                     XAUTHTested = true;
                     InitComplete = true;
+                    TriggerAutoResume();
                     if (Settings.PrivacyMode)
                     {
                         GamerTag = "Gamertag: Hidden";

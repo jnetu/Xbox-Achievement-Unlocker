@@ -2,6 +2,7 @@ using Newtonsoft.Json.Linq;
 using System.Collections.ObjectModel;
 using System.Diagnostics;
 using System.IO;
+using System.Net;
 using System.Net.Http;
 using System.Text;
 using Wpf.Ui.Common;
@@ -105,13 +106,26 @@ namespace XAU.ViewModels.Pages
         private string StateFilePath =>
             Path.Combine(_outputFolderPath, "scanner_state.json");
 
+        // Estado por-jogador: permite retomar scans que falharam parcialmente.
+        // Chave = gamertag em minusculas (case-insensitive lookup).
+        private class PlayerState
+        {
+            public string Gamertag { get; set; } = "";
+            public string Xuid { get; set; } = "";
+            public DateTime CompletedAtUtc { get; set; } = DateTime.MinValue;
+            public int GamesCount { get; set; }
+        }
+        private readonly Dictionary<string, PlayerState> _playerStates =
+            new(StringComparer.OrdinalIgnoreCase);
+        private readonly object _stateLock = new();
+
         private void LoadScanState()
         {
             try
             {
                 if (!File.Exists(StateFilePath)) return;
-                var json = File.ReadAllText(StateFilePath);
-                var obj = JObject.Parse(json);
+                var obj = JObject.Parse(File.ReadAllText(StateFilePath));
+
                 var ts = obj["lastScanAtUtc"]?.Value<DateTime?>();
                 if (ts.HasValue)
                 {
@@ -120,8 +134,26 @@ namespace XAU.ViewModels.Pages
                     LastScanTime = local;
                     LastScanText = $"Ultima varredura: {local}";
                 }
+
+                if (obj["players"] is JObject players)
+                {
+                    foreach (var prop in players.Properties())
+                    {
+                        if (prop.Value is not JObject p) continue;
+                        var doneAt = p["completedAtUtc"]?.Value<DateTime?>();
+                        _playerStates[prop.Name] = new PlayerState
+                        {
+                            Gamertag = p["gamertag"]?.ToString() ?? prop.Name,
+                            Xuid = p["xuid"]?.ToString() ?? "",
+                            CompletedAtUtc = doneAt.HasValue
+                                ? DateTime.SpecifyKind(doneAt.Value, DateTimeKind.Utc)
+                                : DateTime.MinValue,
+                            GamesCount = p["gamesCount"]?.Value<int>() ?? 0
+                        };
+                    }
+                }
             }
-            catch { /* state file invalid — ignora */ }
+            catch { /* state file invalido — ignora */ }
         }
 
         private void SaveScanState()
@@ -129,14 +161,57 @@ namespace XAU.ViewModels.Pages
             try
             {
                 Directory.CreateDirectory(_outputFolderPath);
-                var obj = new JObject
+                JObject obj;
+                lock (_stateLock)
                 {
-                    ["lastScanAtUtc"] = _lastScanAt.ToString("o",
-                        System.Globalization.CultureInfo.InvariantCulture)
-                };
-                File.WriteAllText(StateFilePath, obj.ToString());
+                    obj = new JObject
+                    {
+                        ["lastScanAtUtc"] = _lastScanAt.ToString("o",
+                            System.Globalization.CultureInfo.InvariantCulture)
+                    };
+                    var players = new JObject();
+                    foreach (var kv in _playerStates)
+                    {
+                        players[kv.Key] = new JObject
+                        {
+                            ["gamertag"] = kv.Value.Gamertag,
+                            ["xuid"] = kv.Value.Xuid,
+                            ["completedAtUtc"] = kv.Value.CompletedAtUtc
+                                .ToString("o", System.Globalization.CultureInfo.InvariantCulture),
+                            ["gamesCount"] = kv.Value.GamesCount
+                        };
+                    }
+                    obj["players"] = players;
+                }
+                File.WriteAllText(StateFilePath, obj.ToString(Newtonsoft.Json.Formatting.Indented));
             }
             catch { /* nao critico */ }
+        }
+
+        private void RecordPlayerCompleted(string gamertag, string xuid, int gamesCount)
+        {
+            lock (_stateLock)
+            {
+                _playerStates[gamertag.ToLowerInvariant()] = new PlayerState
+                {
+                    Gamertag = gamertag,
+                    Xuid = xuid,
+                    CompletedAtUtc = DateTime.UtcNow,
+                    GamesCount = gamesCount
+                };
+            }
+            SaveScanState();
+        }
+
+        private bool WasPlayerScannedRecently(string gamertag)
+        {
+            lock (_stateLock)
+            {
+                if (!_playerStates.TryGetValue(gamertag.ToLowerInvariant(), out var ps))
+                    return false;
+                if (ps.CompletedAtUtc == DateTime.MinValue) return false;
+                return (DateTime.UtcNow - ps.CompletedAtUtc) < ScanInterval;
+            }
         }
 
         private void RefreshPlayersFileState()
@@ -338,8 +413,11 @@ namespace XAU.ViewModels.Pages
                     return;
                 }
 
-                var api = new XboxRestAPI(HomeViewModel.XAUTH);
                 int index = 0;
+                int completedThisRun = 0;
+                int skippedRecent = 0;
+                int failed = 0;
+                const int MaxAuthRetries = 3;
 
                 foreach (var gamertag in gamertags)
                 {
@@ -353,89 +431,94 @@ namespace XAU.ViewModels.Pages
                         StatusMessage = "Resolvendo gamertag...";
                     });
 
+                    // Resume: pula jogadores ja concluidos dentro de 24h.
+                    // Permite que scans interrompidos (401, network, cancel)
+                    // continuem de onde pararam no proximo disparo.
+                    if (WasPlayerScannedRecently(gamertag))
+                    {
+                        AddLog($"Pulando {gamertag}: ja concluido nas ultimas 24h");
+                        skippedRecent++;
+                        System.Windows.Application.Current?.Dispatcher.Invoke(() => ProgressoCurrent = index);
+                        continue;
+                    }
+
+                    if (!IsLoggedIn())
+                    {
+                        AddLog("ABORTADO: usuario desconectou. Estado salvo, retomara no proximo scan.");
+                        break;
+                    }
+
                     AddLog($"Iniciando: {gamertag}");
 
-                    try
+                    bool done = false;
+                    int authAttempts = 0;
+
+                    while (!done && authAttempts < MaxAuthRetries)
                     {
-                        var profileData = await api.GetGamertagProfileAsync(gamertag);
-                        if (profileData == null)
+                        // XboxRestAPI fresco a cada tentativa => pega o XAUTH
+                        // atualizado pelo TokenRefreshWorker do HomeViewModel.
+                        var api = new XboxRestAPI(HomeViewModel.XAUTH);
+
+                        try
                         {
-                            AddLog($"ERRO {gamertag}: perfil nulo.");
-                            System.Windows.Application.Current?.Dispatcher.Invoke(() => ProgressoCurrent = index);
-                            continue;
+                            var result = await ScanOnePlayerAsync(api, gamertag,
+                                imagesFolder, profilePictureFolder, ct);
+                            if (result.HasValue)
+                            {
+                                RecordPlayerCompleted(
+                                    result.Value.CanonicalGamertag,
+                                    result.Value.Xuid,
+                                    result.Value.GamesCount);
+                                completedThisRun++;
+                            }
+                            else
+                            {
+                                failed++;
+                            }
+                            done = true;
                         }
-
-                        var userToken = profileData["profileUsers"]?.FirstOrDefault();
-                        if (userToken == null)
+                        catch (OperationCanceledException)
                         {
-                            AddLog($"ERRO {gamertag}: profileUsers vazio.");
-                            System.Windows.Application.Current?.Dispatcher.Invoke(() => ProgressoCurrent = index);
-                            continue;
+                            throw;
                         }
-
-                        string xuid = userToken["id"]?.ToString() ?? "";
-                        if (string.IsNullOrEmpty(xuid))
+                        catch (HttpRequestException ex)
+                            when (ex.StatusCode == HttpStatusCode.Unauthorized)
                         {
-                            AddLog($"ERRO {gamertag}: XUID nao encontrado.");
-                            System.Windows.Application.Current?.Dispatcher.Invoke(() => ProgressoCurrent = index);
-                            continue;
+                            authAttempts++;
+                            if (authAttempts >= MaxAuthRetries)
+                            {
+                                AddLog($"ERRO {gamertag}: 401 persistente apos {MaxAuthRetries} tentativas. Pulando — retomara no proximo scan.");
+                                failed++;
+                                break;
+                            }
+
+                            int waitSec = 60 * authAttempts;
+                            AddLog($"  401 em {gamertag} — aguardando {waitSec}s pro token ser renovado ({authAttempts}/{MaxAuthRetries})");
+                            System.Windows.Application.Current?.Dispatcher.Invoke(() =>
+                                StatusMessage = $"Token expirou — aguardando {waitSec}s pra renovar...");
+
+                            try { await Task.Delay(waitSec * 1000, ct); }
+                            catch (OperationCanceledException) { throw; }
+
+                            if (!IsLoggedIn())
+                            {
+                                AddLog("ABORTADO durante espera: usuario desconectou. Faca login novamente.");
+                                System.Windows.Application.Current?.Dispatcher.Invoke(() => ProgressoCurrent = index);
+                                goto endScanLoop;
+                            }
                         }
-
-                        string canonicalGamertag = userToken["settings"]
-                            ?.FirstOrDefault(s => s["id"]?.ToString() == "Gamertag")
-                            ?["value"]?.ToString() ?? gamertag;
-
-                        // Profile picture (GameDisplayPicRaw). Salva 1x em
-                        // csv/profilePicture/[xuid].jpg; se ja existe, pula.
-                        string? profilePicUrl = userToken["settings"]
-                            ?.FirstOrDefault(s => s["id"]?.ToString() == "GameDisplayPicRaw")
-                            ?["value"]?.ToString();
-                        await DownloadProfilePictureAsync(profilePictureFolder, xuid, profilePicUrl, ct);
-
-                        string playerFolder = Path.Combine(_outputFolderPath, xuid);
-                        Directory.CreateDirectory(playerFolder);
-
-                        System.Windows.Application.Current?.Dispatcher.Invoke(() =>
-                            StatusMessage = $"Buscando jogos de {canonicalGamertag}...");
-
-                        var titlesList = await api.GetGamesListAsync(xuid);
-                        var titles = titlesList?.Titles ?? new List<Title>();
-                        AddLog($"{canonicalGamertag} ({xuid}): {titles.Count} jogos encontrados");
-
-                        if (titles.Count == 0)
+                        catch (Exception ex)
                         {
-                            System.Windows.Application.Current?.Dispatcher.Invoke(() => ProgressoCurrent = index);
-                            continue;
+                            AddLog($"ERRO {gamertag}: {ex.Message}");
+                            failed++;
+                            break;
                         }
-
-                        System.Windows.Application.Current?.Dispatcher.Invoke(() =>
-                            StatusMessage = $"Buscando tempo de jogo (0/{titles.Count})...");
-
-                        var statsMap = await FetchAllStatsAsync(api, xuid, titles, ct);
-
-                        System.Windows.Application.Current?.Dispatcher.Invoke(() =>
-                            StatusMessage = "Salvando CSV...");
-                        await SaveGamesCsvAsync(playerFolder, canonicalGamertag, xuid, titles, statsMap);
-
-                        int withImage = titles.Count(t => !string.IsNullOrWhiteSpace(t.DisplayImage));
-                        System.Windows.Application.Current?.Dispatcher.Invoke(() =>
-                            StatusMessage = $"Baixando imagens... 0/{withImage}");
-                        int downloaded = await DownloadImagesAsync(imagesFolder, titles, ct);
-
-                        AddLog($"{canonicalGamertag}: concluido. {titles.Count} jogos, {downloaded} imagens.");
-                    }
-                    catch (OperationCanceledException)
-                    {
-                        throw;
-                    }
-                    catch (Exception ex)
-                    {
-                        AddLog($"ERRO {gamertag}: {ex.Message}");
                     }
 
                     System.Windows.Application.Current?.Dispatcher.Invoke(() => ProgressoCurrent = index);
                 }
 
+            endScanLoop:
                 _lastScanAt = DateTime.UtcNow;
                 SaveScanState();
                 var local = _lastScanAt.ToLocalTime().ToString("dd/MM/yyyy HH:mm");
@@ -443,9 +526,9 @@ namespace XAU.ViewModels.Pages
                 {
                     LastScanTime = local;
                     LastScanText = $"Ultima varredura: {local}";
-                    StatusMessage = "Varredura completa.";
+                    StatusMessage = $"Concluida — {completedThisRun} ok, {skippedRecent} pulados, {failed} falhas";
                 });
-                AddLog("Varredura completa.");
+                AddLog($"Varredura completa. Concluidos: {completedThisRun}, pulados (recentes): {skippedRecent}, falhas: {failed}");
             }
             catch (OperationCanceledException)
             {
@@ -466,6 +549,93 @@ namespace XAU.ViewModels.Pages
                 });
                 _scanLock.Release();
             }
+        }
+
+        private readonly struct PlayerScanResult
+        {
+            public PlayerScanResult(string canonicalGamertag, string xuid, int gamesCount)
+            {
+                CanonicalGamertag = canonicalGamertag;
+                Xuid = xuid;
+                GamesCount = gamesCount;
+            }
+            public string CanonicalGamertag { get; }
+            public string Xuid { get; }
+            public int GamesCount { get; }
+        }
+
+        /// <summary>
+        /// Faz o scan completo de um jogador. Retorna null se nao foi possivel
+        /// (perfil invalido, sem XUID etc.) ou um PlayerScanResult em sucesso.
+        /// HttpRequestException com StatusCode==Unauthorized propaga pro caller
+        /// (que cuida do retry de token).
+        /// </summary>
+        private async Task<PlayerScanResult?> ScanOnePlayerAsync(
+            XboxRestAPI api, string gamertag,
+            string imagesFolder, string profilePictureFolder, CancellationToken ct)
+        {
+            var profileData = await api.GetGamertagProfileAsync(gamertag);
+            if (profileData == null)
+            {
+                AddLog($"ERRO {gamertag}: perfil nulo.");
+                return null;
+            }
+
+            var userToken = profileData["profileUsers"]?.FirstOrDefault();
+            if (userToken == null)
+            {
+                AddLog($"ERRO {gamertag}: profileUsers vazio.");
+                return null;
+            }
+
+            string xuid = userToken["id"]?.ToString() ?? "";
+            if (string.IsNullOrEmpty(xuid))
+            {
+                AddLog($"ERRO {gamertag}: XUID nao encontrado.");
+                return null;
+            }
+
+            string canonicalGamertag = userToken["settings"]
+                ?.FirstOrDefault(s => s["id"]?.ToString() == "Gamertag")
+                ?["value"]?.ToString() ?? gamertag;
+
+            string? profilePicUrl = userToken["settings"]
+                ?.FirstOrDefault(s => s["id"]?.ToString() == "GameDisplayPicRaw")
+                ?["value"]?.ToString();
+            await DownloadProfilePictureAsync(profilePictureFolder, xuid, profilePicUrl, ct);
+
+            string playerFolder = Path.Combine(_outputFolderPath, xuid);
+            Directory.CreateDirectory(playerFolder);
+
+            System.Windows.Application.Current?.Dispatcher.Invoke(() =>
+                StatusMessage = $"Buscando jogos de {canonicalGamertag}...");
+
+            var titlesList = await api.GetGamesListAsync(xuid);
+            var titles = titlesList?.Titles ?? new List<Title>();
+            AddLog($"{canonicalGamertag} ({xuid}): {titles.Count} jogos encontrados");
+
+            if (titles.Count == 0)
+            {
+                // Biblioteca vazia conta como scan completo — nao queremos retry.
+                return new PlayerScanResult(canonicalGamertag, xuid, 0);
+            }
+
+            System.Windows.Application.Current?.Dispatcher.Invoke(() =>
+                StatusMessage = $"Buscando tempo de jogo (0/{titles.Count})...");
+
+            var statsMap = await FetchAllStatsAsync(api, xuid, titles, ct);
+
+            System.Windows.Application.Current?.Dispatcher.Invoke(() =>
+                StatusMessage = "Salvando CSV...");
+            await SaveGamesCsvAsync(playerFolder, canonicalGamertag, xuid, titles, statsMap);
+
+            int withImage = titles.Count(t => !string.IsNullOrWhiteSpace(t.DisplayImage));
+            System.Windows.Application.Current?.Dispatcher.Invoke(() =>
+                StatusMessage = $"Baixando imagens... 0/{withImage}");
+            int downloaded = await DownloadImagesAsync(imagesFolder, titles, ct);
+
+            AddLog($"{canonicalGamertag}: concluido. {titles.Count} jogos, {downloaded} imagens.");
+            return new PlayerScanResult(canonicalGamertag, xuid, titles.Count);
         }
 
         // Stats fetching: serial + cache em disco + backoff. O endpoint
@@ -583,11 +753,17 @@ namespace XAU.ViewModels.Pages
                 else consecutiveFailures++;
 
                 map[title.TitleId!] = minutes;
-                cache[title.TitleId!] = new StatsCacheEntry
+                // Cache APENAS quando a chamada foi bem-sucedida. Assim, se
+                // o token expirou e veio 401 (response vazio), o proximo scan
+                // re-tenta esse titulo em vez de servir 0 minutos do cache.
+                if (got)
                 {
-                    Minutes = minutes,
-                    FetchedAtUtc = DateTime.UtcNow
-                };
+                    cache[title.TitleId!] = new StatsCacheEntry
+                    {
+                        Minutes = minutes,
+                        FetchedAtUtc = DateTime.UtcNow
+                    };
+                }
 
                 done++;
                 if (done % 25 == 0 || done == total)

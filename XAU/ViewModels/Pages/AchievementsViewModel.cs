@@ -43,6 +43,10 @@ namespace XAU.ViewModels.Pages
         private DateTime _nextUnlockAt = DateTime.MinValue;
         private DispatcherTimer? _countdownTimer;
         private readonly Random _rng = new Random();
+        private bool _autoUnlockResumeTried = false;
+
+        private static string AutoUnlockStatePath =>
+            Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.MyDocuments), "XAU", "autounlock_state.json");
 
         public static string TitleID = "0";
         private bool IsTitleIDValid = false;
@@ -686,6 +690,7 @@ namespace XAU.ViewModels.Pages
                 AutoUnlockButtonText = "Auto-Unlock";
                 NextUnlockCountdown = "---, --:--:--";
                 AutoUnlockConfigEnabled = true;
+                SaveAutoUnlockState(false);
                 return;
             }
 
@@ -708,6 +713,7 @@ namespace XAU.ViewModels.Pages
             IsAutoUnlocking = true;
             AutoUnlockButtonText = "Stop Auto-Unlock";
             AutoUnlockConfigEnabled = false;
+            SaveAutoUnlockState(true);
 
             _autoUnlockCts = new CancellationTokenSource();
             StartCountdownTimer();
@@ -757,6 +763,7 @@ namespace XAU.ViewModels.Pages
                 AutoUnlockConfigEnabled = true;
                 _countdownTimer?.Stop();
                 NextUnlockCountdown = "---, --:--:--";
+                SaveAutoUnlockState(false);
                 if (!ct.IsCancellationRequested)
                 {
                     _snackbarService.Show("Auto-Unlock Complete",
@@ -786,6 +793,71 @@ namespace XAU.ViewModels.Pages
                 NextUnlockCountdown = $"{(int)remaining.TotalDays}, {remaining.Hours:D2}:{remaining.Minutes:D2}:{remaining.Seconds:D2}";
             };
             _countdownTimer.Start();
+        }
+
+        // ---- Persistencia do Auto-Unlock / auto-retomada (padrao ScannerViewModel) ----
+
+        private void SaveAutoUnlockState(bool active)
+        {
+            try
+            {
+                Directory.CreateDirectory(Path.GetDirectoryName(AutoUnlockStatePath)!);
+                var obj = new JObject
+                {
+                    ["active"] = active,
+                    ["minMinutes"] = AutoUnlockMinMinutes,
+                    ["maxMinutes"] = AutoUnlockMaxMinutes,
+                    ["titleId"] = TitleIDOverride
+                };
+                File.WriteAllText(AutoUnlockStatePath, obj.ToString(Formatting.Indented));
+            }
+            catch { /* nao critico */ }
+        }
+
+        private AutoUnlockState LoadAutoUnlockState()
+        {
+            try
+            {
+                if (!File.Exists(AutoUnlockStatePath)) return null;
+                var obj = JObject.Parse(File.ReadAllText(AutoUnlockStatePath));
+                return new AutoUnlockState
+                {
+                    Active = obj["active"]?.Value<bool>() ?? false,
+                    MinMinutes = obj["minMinutes"]?.Value<int>() ?? 60,
+                    MaxMinutes = obj["maxMinutes"]?.Value<int>() ?? 120,
+                    TitleId = obj["titleId"]?.ToString() ?? "0"
+                };
+            }
+            catch { return null; }
+        }
+
+        // Chamado no startup (apos login): religa o auto-unlock silenciosamente se estava ativo ao fechar.
+        // Resume completo: restaura titulo + Min/Max, carrega achievements e reusa ToggleAutoUnlock
+        // (que ja ordena a fila por RarityPercentage desc). Os botoes continuam permitindo trocar de titulo.
+        public async Task TryAutoResumeAutoUnlock()
+        {
+            if (_autoUnlockResumeTried) return;
+            _autoUnlockResumeTried = true;
+
+            var state = LoadAutoUnlockState();
+            if (state == null || !state.Active ||
+                string.IsNullOrWhiteSpace(state.TitleId) || state.TitleId == "0")
+                return;
+            if (IsAutoUnlocking) return;
+
+            AutoUnlockMinMinutes = state.MinMinutes;
+            AutoUnlockMaxMinutes = state.MaxMinutes;
+            TitleIDOverride = state.TitleId;
+            Unlockable = true; // estava em auto-unlock -> habilita para a fila nao vir vazia
+
+            await LoadGameInfo();
+            await LoadAchievements();
+
+            System.Windows.Application.Current.Dispatcher.Invoke(() =>
+            {
+                if (!IsAutoUnlocking && DGAchievements.Any(a => a.IsUnlockable))
+                    ToggleAutoUnlock();
+            });
         }
 
         [RelayCommand]

@@ -488,6 +488,14 @@
                                                     FontWeight="SemiBold"
                                                     Foreground="{DynamicResource TextFillColorPrimaryBrush}"
                                                     Text="{Binding SpoofingDuration}" />
+                                                <TextBlock
+                                                    Margin="0,2,0,0"
+                                                    HorizontalAlignment="Right"
+                                                    FontSize="12"
+                                                    FontWeight="Medium"
+                                                    Foreground="{DynamicResource TextFillColorSecondaryBrush}"
+                                                    Text="{Binding LastSessionDelta}"
+                                                    ToolTip="Variacao de horas jogadas na ultima sessao" />
                                             </StackPanel>
                                         </Grid>
                                     </Border>

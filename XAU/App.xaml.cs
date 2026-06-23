@@ -45,7 +45,7 @@ public partial class App
             services.AddSingleton<DebugViewModel>();
         }).Build();
 
-    private static T? GetService<T>() where T : class
+    public static T? GetService<T>() where T : class
     {
         return Host.Services.GetService(typeof(T)) as T;
     }

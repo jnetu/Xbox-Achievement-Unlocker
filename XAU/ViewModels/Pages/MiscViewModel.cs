@@ -209,6 +209,18 @@ namespace XAU.ViewModels.Pages
         private bool _multiSpoofingUpdate = false;
         private Lazy<XboxRestAPI> _multiXboxRestAPI = new Lazy<XboxRestAPI>(() => new XboxRestAPI(HomeViewModel.XAUTH));
 
+        // --- Multi-Spoof persistencia/historico (Documents\XAU) ---
+        private readonly object _multiStateLock = new();
+        private DateTime _multiSessionStartedAtUtc = DateTime.MinValue;
+        // titleId -> (name, minutos jogados no inicio da sessao)
+        private readonly Dictionary<string, (string Name, int Minutes)> _multiSessionStartMinutes = new();
+        private bool _multiAutoResumeTried = false;
+
+        private static string XAUFolder =>
+            Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.MyDocuments), "XAU");
+        private static string MultiSpoofStatePath => Path.Combine(XAUFolder, "multispoof_state.json");
+        private static string MultiSpoofHistoryPath => Path.Combine(XAUFolder, "multispoof_history.json");
+
         [RelayCommand]
         public async Task MultiSpooferButtonClicked()
         {
@@ -218,7 +230,10 @@ namespace XAU.ViewModels.Pages
                 _multiCurrentlySpoofing = false;
                 MultiSpoofingButtonText = "Start Multi-Spoof";
                 MultiSpoofingStatusText = "Multi-Spoofing Not Started";
+                await RecordMultiSpoofSessionEndAsync();
+                SaveMultiSpoofState(false, new List<string>());
                 System.Windows.Application.Current.Dispatcher.Invoke(() => MultiSpoofGames.Clear());
+                lock (_multiStateLock) _multiSessionStartMinutes.Clear();
                 await _multiXboxRestAPI.Value.StopHeartbeatAsync(HomeViewModel.XUIDOnly);
                 return;
             }
@@ -252,8 +267,12 @@ namespace XAU.ViewModels.Pages
             var validIds = MultiSpoofGames.Select(g => g.TitleId).ToList();
             _multiCurrentlySpoofing = true;
             _multiSpoofingUpdate = false;
+            _multiSessionStartedAtUtc = DateTime.UtcNow;
             MultiSpoofingButtonText = "Stop Multi-Spoof";
             MultiSpoofingStatusText = $"Multi-Spoofing {validIds.Count} title(s)";
+
+            SaveMultiSpoofState(true, validIds);
+            ApplyLastSessionDeltas(); // mostra o delta da sessao anterior em cada jogo
 
             _ = Task.Run(() => MultiSpoofingLoop(validIds));
         }
@@ -281,9 +300,12 @@ namespace XAU.ViewModels.Pages
                     string gamerscore = $"{title.Achievement?.CurrentGamerscore ?? 0}/{title.Achievement?.TotalGamerscore ?? 0}";
 
                     string timePlayed;
+                    int minutesAtStart = 0;
                     try
                     {
-                        var t = TimeSpan.FromMinutes(Convert.ToDouble(gameStats.StatListsCollection[0].Stats[0].Value));
+                        var rawMinutes = Convert.ToDouble(gameStats.StatListsCollection[0].Stats[0].Value);
+                        minutesAtStart = (int)rawMinutes;
+                        var t = TimeSpan.FromMinutes(rawMinutes);
                         timePlayed = $"{t.Days} Days, {t.Hours} Hours and {t.Minutes} minutes";
                     }
                     catch
@@ -299,6 +321,9 @@ namespace XAU.ViewModels.Pages
                         Gamerscore = gamerscore,
                         TimePlayed = timePlayed
                     };
+
+                    lock (_multiStateLock)
+                        _multiSessionStartMinutes[item.TitleId] = (item.Name, minutesAtStart);
 
                     System.Windows.Application.Current.Dispatcher.Invoke(() => MultiSpoofGames.Add(item));
                 }
@@ -331,6 +356,7 @@ namespace XAU.ViewModels.Pages
                 if (i == 300)
                 {
                     await _multiXboxRestAPI.Value.SendHeartbeatAsync(HomeViewModel.XUIDOnly, titleIds);
+                    SaveMultiSpoofState(true, titleIds); // heartbeat -> atualiza lastSavedAtUtc
                     i = 0;
                 }
                 else
@@ -349,6 +375,144 @@ namespace XAU.ViewModels.Pages
                 }
                 Thread.Sleep(1000);
             }
+        }
+
+        // ---- Persistencia de estado / historico / auto-retomada (padrao ScannerViewModel) ----
+
+        private void SaveMultiSpoofState(bool active, List<string> titleIds)
+        {
+            try
+            {
+                Directory.CreateDirectory(XAUFolder);
+                JObject obj;
+                lock (_multiStateLock)
+                {
+                    obj = new JObject
+                    {
+                        ["active"] = active,
+                        ["titleIds"] = new JArray(titleIds ?? new List<string>()),
+                        ["startedAtUtc"] = _multiSessionStartedAtUtc.ToString("o", System.Globalization.CultureInfo.InvariantCulture),
+                        ["lastSavedAtUtc"] = DateTime.UtcNow.ToString("o", System.Globalization.CultureInfo.InvariantCulture)
+                    };
+                }
+                File.WriteAllText(MultiSpoofStatePath, obj.ToString(Newtonsoft.Json.Formatting.Indented));
+            }
+            catch { /* nao critico */ }
+        }
+
+        private MultiSpoofState LoadMultiSpoofState()
+        {
+            try
+            {
+                if (!File.Exists(MultiSpoofStatePath)) return null;
+                var obj = JObject.Parse(File.ReadAllText(MultiSpoofStatePath));
+                var started = obj["startedAtUtc"]?.Value<DateTime?>();
+                return new MultiSpoofState
+                {
+                    Active = obj["active"]?.Value<bool>() ?? false,
+                    TitleIds = obj["titleIds"]?.ToObject<List<string>>() ?? new List<string>(),
+                    StartedAtUtc = started.HasValue
+                        ? DateTime.SpecifyKind(started.Value, DateTimeKind.Utc)
+                        : DateTime.MinValue
+                };
+            }
+            catch { return null; }
+        }
+
+        private MultiSpoofHistory LoadMultiSpoofHistory()
+        {
+            try
+            {
+                if (!File.Exists(MultiSpoofHistoryPath)) return new MultiSpoofHistory();
+                return Newtonsoft.Json.JsonConvert.DeserializeObject<MultiSpoofHistory>(
+                           File.ReadAllText(MultiSpoofHistoryPath)) ?? new MultiSpoofHistory();
+            }
+            catch { return new MultiSpoofHistory(); }
+        }
+
+        private void SaveMultiSpoofHistory(MultiSpoofSession session)
+        {
+            try
+            {
+                Directory.CreateDirectory(XAUFolder);
+                var hist = LoadMultiSpoofHistory();
+                hist.Sessions.Add(session);
+                while (hist.Sessions.Count > 2) hist.Sessions.RemoveAt(0); // FIFO: guarda as 2 ultimas
+                File.WriteAllText(MultiSpoofHistoryPath,
+                    Newtonsoft.Json.JsonConvert.SerializeObject(hist, Newtonsoft.Json.Formatting.Indented));
+            }
+            catch { /* nao critico */ }
+        }
+
+        // Re-busca os minutos jogados ao parar e grava a sessao no historico.
+        private async Task RecordMultiSpoofSessionEndAsync()
+        {
+            Dictionary<string, (string Name, int Minutes)> startSnapshot;
+            lock (_multiStateLock) startSnapshot = new(_multiSessionStartMinutes);
+            if (startSnapshot.Count == 0) return;
+
+            var session = new MultiSpoofSession
+            {
+                StartedAtUtc = _multiSessionStartedAtUtc,
+                EndedAtUtc = DateTime.UtcNow
+            };
+
+            foreach (var kv in startSnapshot)
+            {
+                int endMinutes = kv.Value.Minutes;
+                try
+                {
+                    var stats = await _multiXboxRestAPI.Value.GetGameStatsAsync(HomeViewModel.XUIDOnly, kv.Key);
+                    endMinutes = (int)Convert.ToDouble(stats.StatListsCollection[0].Stats[0].Value);
+                }
+                catch { /* mantem minutos do inicio se a re-busca falhar */ }
+
+                session.Games.Add(new MultiSpoofGameDelta
+                {
+                    TitleId = kv.Key,
+                    Name = kv.Value.Name,
+                    MinutesAtStart = kv.Value.Minutes,
+                    MinutesAtEnd = endMinutes,
+                    Delta = endMinutes - kv.Value.Minutes
+                });
+            }
+
+            SaveMultiSpoofHistory(session);
+            ApplyLastSessionDeltas();
+        }
+
+        // Preenche LastSessionDelta de cada jogo carregado com base na ultima sessao do historico.
+        private void ApplyLastSessionDeltas()
+        {
+            var hist = LoadMultiSpoofHistory();
+            var last = hist.Sessions.LastOrDefault();
+            if (last == null) return;
+            var map = last.Games
+                .GroupBy(g => g.TitleId)
+                .ToDictionary(g => g.Key, g => g.Last().Delta);
+
+            System.Windows.Application.Current.Dispatcher.Invoke(() =>
+            {
+                foreach (var item in MultiSpoofGames)
+                {
+                    if (map.TryGetValue(item.TitleId, out var delta))
+                        item.LastSessionDelta = delta > 0 ? $"+{delta} min" : "sem aumento";
+                }
+            });
+        }
+
+        // Chamado no startup (apos login): religa o multi-spoof silenciosamente se estava ativo ao fechar.
+        public async Task TryAutoResumeMultiSpoof()
+        {
+            if (_multiAutoResumeTried) return;
+            _multiAutoResumeTried = true;
+
+            var state = LoadMultiSpoofState();
+            if (state == null || !state.Active || state.TitleIds.Count == 0) return;
+            if (_multiCurrentlySpoofing) return;
+
+            MultiSpoofingIDs = string.Join(", ", state.TitleIds);
+            await MultiSpooferButtonClicked(); // reusa o caminho existente (Load + Loop + SaveState)
         }
 
         #endregion
