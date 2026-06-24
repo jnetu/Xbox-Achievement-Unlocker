@@ -16,12 +16,20 @@ public class XboxRestAPI
     private readonly HttpClient _spooferClient;
 
     // User specifics
-    private readonly string _xauth;
+    private readonly Func<string> _xauthProvider;
     private readonly string _requestedResponseLanguage;
 
-    public XboxRestAPI(string xauth)
+    // Always resolves the *current* XAUTH. Using a provider (instead of a value captured
+    // once at construction) means long-lived/cached XboxRestAPI instances keep working
+    // after the token is refreshed/rotated. This is what fixes the stale-token 401s that
+    // broke auto-unlock, multi-spoof heartbeats and the "have to restart daily" login.
+    private string Xauth => _xauthProvider();
+
+    public XboxRestAPI(string xauth) : this(() => xauth) { }
+
+    public XboxRestAPI(Func<string> xauthProvider)
     {
-        _xauth = xauth;
+        _xauthProvider = xauthProvider ?? throw new ArgumentNullException(nameof(xauthProvider));
         _requestedResponseLanguage = HomeViewModel.Settings.RegionOverride ? "en-GB" : System.Globalization.CultureInfo.CurrentCulture.Name;
         var handler = new HttpClientHandler()
         {
@@ -42,7 +50,7 @@ public class XboxRestAPI
     private void SetDefaultHeaders()
     {
         _httpClient.DefaultRequestHeaders.Clear();
-        _httpClient.DefaultRequestHeaders.Add(HeaderNames.Authorization, _xauth);
+        _httpClient.DefaultRequestHeaders.Add(HeaderNames.Authorization, Xauth);
         _httpClient.DefaultRequestHeaders.Add(HeaderNames.AcceptLanguage, _requestedResponseLanguage);
         _httpClient.DefaultRequestHeaders.Add(HeaderNames.AcceptEncoding, HeaderValues.AcceptEncoding);
         _httpClient.DefaultRequestHeaders.Add(HeaderNames.Accept, HeaderValues.Accept);
@@ -61,7 +69,7 @@ public class XboxRestAPI
     private void SetDefaultSpooferHeaders()
     {
         _spooferClient.DefaultRequestHeaders.Clear();
-        _spooferClient.DefaultRequestHeaders.Add(HeaderNames.Authorization, _xauth);
+        _spooferClient.DefaultRequestHeaders.Add(HeaderNames.Authorization, Xauth);
         _spooferClient.DefaultRequestHeaders.Add(HeaderNames.AcceptLanguage, _requestedResponseLanguage);
         _spooferClient.DefaultRequestHeaders.Add(HeaderNames.AcceptEncoding, HeaderValues.AcceptEncoding);
         _spooferClient.DefaultRequestHeaders.Add(HeaderNames.Accept, HeaderValues.Accept);
@@ -90,7 +98,7 @@ public class XboxRestAPI
         _eventBasedClient.DefaultRequestHeaders.Add(HeaderNames.Host, Hosts.Telemetry);
         _eventBasedClient.DefaultRequestHeaders.Add(HeaderNames.Connection, "close");
         ;
-        var authxtoken = Regex.Replace(_xauth, @"XBL3\.0 x=\d+;", "XBL3.0 x=-;");
+        var authxtoken = Regex.Replace(Xauth, @"XBL3\.0 x=\d+;", "XBL3.0 x=-;");
         _eventBasedClient.DefaultRequestHeaders.Add("authxtoken", authxtoken);
 
 #if DEBUG

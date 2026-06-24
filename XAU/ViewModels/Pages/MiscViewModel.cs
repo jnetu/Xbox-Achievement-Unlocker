@@ -21,7 +21,7 @@ namespace XAU.ViewModels.Pages
         private readonly IContentDialogService _contentDialogService;
         private readonly ISnackbarService _snackbarService;
         private TimeSpan _snackbarDuration = TimeSpan.FromSeconds(2);
-        private Lazy<XboxRestAPI> _xboxRestAPI = new Lazy<XboxRestAPI>(() => new XboxRestAPI(HomeViewModel.XAUTH));
+        private Lazy<XboxRestAPI> _xboxRestAPI = new Lazy<XboxRestAPI>(() => new XboxRestAPI(() => HomeViewModel.XAUTH));
 
 
 
@@ -207,7 +207,7 @@ namespace XAU.ViewModels.Pages
         [ObservableProperty] private ObservableCollection<MultiSpoofGameItem> _multiSpoofGames = new();
         private bool _multiCurrentlySpoofing = false;
         private bool _multiSpoofingUpdate = false;
-        private Lazy<XboxRestAPI> _multiXboxRestAPI = new Lazy<XboxRestAPI>(() => new XboxRestAPI(HomeViewModel.XAUTH));
+        private Lazy<XboxRestAPI> _multiXboxRestAPI = new Lazy<XboxRestAPI>(() => new XboxRestAPI(() => HomeViewModel.XAUTH));
 
         // --- Multi-Spoof persistencia/historico (Documents\XAU) ---
         private readonly object _multiStateLock = new();
@@ -356,7 +356,8 @@ namespace XAU.ViewModels.Pages
                 if (i == 300)
                 {
                     await _multiXboxRestAPI.Value.SendHeartbeatAsync(HomeViewModel.XUIDOnly, titleIds);
-                    SaveMultiSpoofState(true, titleIds); // heartbeat -> atualiza lastSavedAtUtc
+                    await UpdateLiveDeltasAsync(titleIds);   // re-fetch playtime and show "+X min" live
+                    SaveMultiSpoofState(true, titleIds);     // heartbeat -> refresh lastSavedAtUtc
                     i = 0;
                 }
                 else
@@ -387,12 +388,22 @@ namespace XAU.ViewModels.Pages
                 JObject obj;
                 lock (_multiStateLock)
                 {
+                    var startObj = new JObject();
+                    foreach (var kv in _multiSessionStartMinutes)
+                    {
+                        startObj[kv.Key] = new JObject
+                        {
+                            ["name"] = kv.Value.Name,
+                            ["minutes"] = kv.Value.Minutes
+                        };
+                    }
                     obj = new JObject
                     {
                         ["active"] = active,
                         ["titleIds"] = new JArray(titleIds ?? new List<string>()),
                         ["startedAtUtc"] = _multiSessionStartedAtUtc.ToString("o", System.Globalization.CultureInfo.InvariantCulture),
-                        ["lastSavedAtUtc"] = DateTime.UtcNow.ToString("o", System.Globalization.CultureInfo.InvariantCulture)
+                        ["lastSavedAtUtc"] = DateTime.UtcNow.ToString("o", System.Globalization.CultureInfo.InvariantCulture),
+                        ["startMinutes"] = startObj
                     };
                 }
                 File.WriteAllText(MultiSpoofStatePath, obj.ToString(Newtonsoft.Json.Formatting.Indented));
@@ -407,13 +418,28 @@ namespace XAU.ViewModels.Pages
                 if (!File.Exists(MultiSpoofStatePath)) return null;
                 var obj = JObject.Parse(File.ReadAllText(MultiSpoofStatePath));
                 var started = obj["startedAtUtc"]?.Value<DateTime?>();
+
+                var startMinutes = new Dictionary<string, MultiSpoofBaselineEntry>();
+                if (obj["startMinutes"] is JObject startObj)
+                {
+                    foreach (var prop in startObj.Properties())
+                    {
+                        startMinutes[prop.Name] = new MultiSpoofBaselineEntry
+                        {
+                            Name = prop.Value["name"]?.ToString() ?? "",
+                            Minutes = prop.Value["minutes"]?.Value<int>() ?? 0
+                        };
+                    }
+                }
+
                 return new MultiSpoofState
                 {
                     Active = obj["active"]?.Value<bool>() ?? false,
                     TitleIds = obj["titleIds"]?.ToObject<List<string>>() ?? new List<string>(),
                     StartedAtUtc = started.HasValue
                         ? DateTime.SpecifyKind(started.Value, DateTimeKind.Utc)
-                        : DateTime.MinValue
+                        : DateTime.MinValue,
+                    StartMinutes = startMinutes
                 };
             }
             catch { return null; }
@@ -496,9 +522,79 @@ namespace XAU.ViewModels.Pages
                 foreach (var item in MultiSpoofGames)
                 {
                     if (map.TryGetValue(item.TitleId, out var delta))
-                        item.LastSessionDelta = delta > 0 ? $"+{delta} min" : "sem aumento";
+                        item.LastSessionDelta = delta > 0 ? $"Last session: +{delta} min" : "Last session: no increase";
                 }
             });
+        }
+
+        // During the active session: re-fetch each title's playtime and show live how much has been
+        // added since the session started (addresses "the games are increasing but it isn't displayed").
+        private async Task UpdateLiveDeltasAsync(List<string> titleIds)
+        {
+            Dictionary<string, (string Name, int Minutes)> baseline;
+            lock (_multiStateLock) baseline = new(_multiSessionStartMinutes);
+            if (baseline.Count == 0) return;
+
+            foreach (var id in titleIds)
+            {
+                if (!baseline.TryGetValue(id, out var start)) continue;
+
+                int current;
+                try
+                {
+                    var stats = await _multiXboxRestAPI.Value.GetGameStatsAsync(HomeViewModel.XUIDOnly, id);
+                    current = (int)Convert.ToDouble(stats.StatListsCollection[0].Stats[0].Value);
+                }
+                catch { continue; } // keep the previous value if the re-fetch fails
+
+                int delta = current - start.Minutes;
+                var t = TimeSpan.FromMinutes(current);
+                var playedStr = $"{t.Days} Days, {t.Hours} Hours and {t.Minutes} minutes";
+
+                System.Windows.Application.Current.Dispatcher.Invoke(() =>
+                {
+                    var item = MultiSpoofGames.FirstOrDefault(g => g.TitleId == id);
+                    if (item == null) return;
+                    item.TimePlayed = playedStr;
+                    item.LastSessionDelta = delta > 0 ? $"+{delta} min this session" : "This session: no increase yet";
+                });
+            }
+        }
+
+        // Closes into history a session that stayed active but was never stopped (app closed/crash/restart),
+        // using the persisted baseline. This caches the "last session" even without a clean stop.
+        private async Task FinalizeInterruptedSessionAsync(MultiSpoofState state)
+        {
+            if (state?.StartMinutes == null || state.StartMinutes.Count == 0) return;
+
+            var session = new MultiSpoofSession
+            {
+                StartedAtUtc = state.StartedAtUtc,
+                EndedAtUtc = DateTime.UtcNow
+            };
+
+            foreach (var kv in state.StartMinutes)
+            {
+                int startMin = kv.Value.Minutes;
+                int endMin = startMin;
+                try
+                {
+                    var stats = await _multiXboxRestAPI.Value.GetGameStatsAsync(HomeViewModel.XUIDOnly, kv.Key);
+                    endMin = (int)Convert.ToDouble(stats.StatListsCollection[0].Stats[0].Value);
+                }
+                catch { /* keep the baseline if the re-fetch fails */ }
+
+                session.Games.Add(new MultiSpoofGameDelta
+                {
+                    TitleId = kv.Key,
+                    Name = kv.Value.Name,
+                    MinutesAtStart = startMin,
+                    MinutesAtEnd = endMin,
+                    Delta = endMin - startMin
+                });
+            }
+
+            SaveMultiSpoofHistory(session);
         }
 
         // Chamado no startup (apos login): religa o multi-spoof silenciosamente se estava ativo ao fechar.
@@ -510,6 +606,10 @@ namespace XAU.ViewModels.Pages
             var state = LoadMultiSpoofState();
             if (state == null || !state.Active || state.TitleIds.Count == 0) return;
             if (_multiCurrentlySpoofing) return;
+
+            // The previous session was never stopped (app closed/restart). Close it into history now,
+            // using the persisted baseline, so the "last session" delta is cached and displayed.
+            await FinalizeInterruptedSessionAsync(state);
 
             MultiSpoofingIDs = string.Join(", ", state.TitleIds);
             await MultiSpooferButtonClicked(); // reusa o caminho existente (Load + Loop + SaveState)

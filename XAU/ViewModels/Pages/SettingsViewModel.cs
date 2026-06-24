@@ -70,23 +70,33 @@ namespace XAU.ViewModels.Pages
         [RelayCommand]
         private void ToggleServer()
         {
-            if (_httpServer == null)
+            // The HttpListener-backed server can fail to initialize on some machines (assembly
+            // resolution / permissions). Catch it here so toggling shows an error instead of
+            // taking down the whole app.
+            try
             {
-                var routes = Routes.GetRoutes(
-                    getXauthToken: () => HomeViewModel.XAUTH,
-                    getXboxRestAPI: () => new XboxRestAPI(HomeViewModel.XAUTH),
-                    getXUIDOnly: () => HomeViewModel.XUIDOnly
-                ); _httpServer = new HttpServer(ServerPort, routes);
+                ToggleServerInternal();
             }
+            catch (Exception ex)
+            {
+                ServerEnabled = false;
+                ListeningAddress = $"Server unavailable: {ex.Message}";
+                Debug.WriteLine($"Failed to toggle API server: {ex}");
+            }
+        }
+
+        private void ToggleServerInternal()
+        {
+            EnsureHttpServer();
 
             if (ServerEnabled)
             {
-                _httpServer.Start();
+                _httpServer!.Start();
                 UpdateListeningAddress();
             }
             else
             {
-                _httpServer.Stop();
+                _httpServer!.Stop();
                 ListeningAddress = $"http://localhost:{ServerPort}";
             }
             // TO DO: SAVE SERVER ENABLED/DISABLED STATUS & PORT NUMBER
@@ -155,16 +165,27 @@ namespace XAU.ViewModels.Pages
             SettingsVersion = "2";
             _isInitialized = true;
 
-            if (_httpServer == null)
-            {
-                var routes = Routes.GetRoutes(
-                    getXauthToken: () => HomeViewModel.XAUTH,
-                    getXboxRestAPI: () => new XboxRestAPI(HomeViewModel.XAUTH),
-                    getXUIDOnly: () => HomeViewModel.XUIDOnly
-                );
-                _httpServer = new HttpServer(ServerPort, routes);
-            }
+            // NB: do NOT construct the HttpServer here. Doing so just to open the Settings page
+            // eagerly loads System.Net.HttpListener; if that assembly fails to resolve at runtime
+            // it throws (FileNotFoundException) and crashes navigation into Settings. The server is
+            // an optional feature (XAU Mobile API), so it's now created lazily in EnsureHttpServer()
+            // only when the user actually toggles it on.
             ListeningAddress = $"http://localhost:{ServerPort}";
+        }
+
+        // Lazily creates the HttpServer the first time it's actually needed. Isolated so the
+        // HttpListener assembly is only touched on demand and any load/creation failure can be
+        // caught by the caller instead of bubbling up as an unhandled crash.
+        private bool EnsureHttpServer()
+        {
+            if (_httpServer != null) return true;
+            var routes = Routes.GetRoutes(
+                getXauthToken: () => HomeViewModel.XAUTH,
+                getXboxRestAPI: () => new XboxRestAPI(() => HomeViewModel.XAUTH),
+                getXUIDOnly: () => HomeViewModel.XUIDOnly
+            );
+            _httpServer = new HttpServer(ServerPort, routes);
+            return true;
         }
 
         public void LoadSettings()

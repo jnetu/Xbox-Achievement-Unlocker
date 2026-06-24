@@ -39,7 +39,7 @@ namespace XAU.ViewModels.Pages
         }
 
         // TODO: this needs to be updated if language changes
-        private Lazy<XboxRestAPI> _xboxRestAPI = new Lazy<XboxRestAPI>(() => new XboxRestAPI(HomeViewModel.XAUTH));
+        private Lazy<XboxRestAPI> _xboxRestAPI = new Lazy<XboxRestAPI>(() => new XboxRestAPI(() => HomeViewModel.XAUTH));
 
         private readonly IContentDialogService _contentDialogService;
         private readonly ISnackbarService _snackbarService = snackbarService;

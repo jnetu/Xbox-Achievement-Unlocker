@@ -74,8 +74,10 @@ namespace XAU.ViewModels.Pages
             _snackbarService = snackbarService;
             _contentDialogService = contentDialogService;
 
-            // Assume XAUTH and System Language are set by the time this is actually instantiated
-            _xboxRestAPI = new Lazy<XboxRestAPI>(() => new XboxRestAPI(XAUTH));
+            // Provider-based so the cached instance always uses the *current* XAUTH. Otherwise,
+            // after the Xbox-app/OAuth token rotates, this instance keeps sending the old token
+            // (401), TestXAUTH/GrabProfile keep failing, and the only fix is restarting the app.
+            _xboxRestAPI = new Lazy<XboxRestAPI>(() => new XboxRestAPI(() => XAUTH));
         }
         private readonly ISnackbarService _snackbarService;
         private TimeSpan _snackbarDuration = TimeSpan.FromSeconds(2);
@@ -533,8 +535,14 @@ namespace XAU.ViewModels.Pages
                 XAUTHTested = false;
             }
         }
+        private bool _testingXauth = false;
         private async void TestXAUTH()
         {
+            // XauthWorker_ProgressChanged polls ~1x/sec and calls this whenever XAUTHTested is still
+            // false. Since XAUTHTested only flips at the end of this async method, without this guard
+            // several TestXAUTH calls stack up concurrently -> duplicate work and snackbar spam.
+            if (_testingXauth) return;
+            _testingXauth = true;
             try
             {
                 var response = await _xboxRestAPI.Value.GetBasicProfileAsync();
@@ -573,6 +581,15 @@ namespace XAU.ViewModels.Pages
                     XAUTHTested = true;
 
                 }
+            }
+            catch
+            {
+                // Transient (network/parse/etc.). Don't crash the app from this async-void worker
+                // path; leave XAUTHTested false so the polling loop simply retries next tick.
+            }
+            finally
+            {
+                _testingXauth = false;
             }
         }
         #endregion
@@ -1205,8 +1222,16 @@ namespace XAU.ViewModels.Pages
 
         #endregion
         #region Profile
+        private bool _grabbingProfile = false;
         private async void GrabProfile()
         {
+            // Called from XauthWorker_ProgressChanged (polls ~1x/sec) and from the login paths.
+            // GrabbedProfile only flips at the end, so without this guard multiple GrabProfile calls
+            // run concurrently and each fires a "Profile information grabbed" success snackbar — the
+            // bursts of repeated success popups the user reported. Guard only against *concurrency*
+            // (not GrabbedProfile) so the manual "Refresh Profile" button still re-grabs on demand.
+            if (_grabbingProfile) return;
+            _grabbingProfile = true;
             try
             {
                 var profileResponse = await _xboxRestAPI.Value.GetProfileAsync(XUIDOnly);
@@ -1320,6 +1345,10 @@ namespace XAU.ViewModels.Pages
             catch (Exception ex)
             {
                 _snackbarService.Show("Error", "Failed to grab profile information. " + ex.Message, ControlAppearance.Danger, new SymbolIcon(SymbolRegular.ErrorCircle24), _snackbarDuration);
+            }
+            finally
+            {
+                _grabbingProfile = false;
             }
         }
         #endregion

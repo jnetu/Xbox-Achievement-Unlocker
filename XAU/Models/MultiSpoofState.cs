@@ -8,6 +8,16 @@ public class MultiSpoofState
     public List<string> TitleIds { get; set; } = new();
     public DateTime StartedAtUtc { get; set; }
     public DateTime LastSavedAtUtc { get; set; }
+
+    // Minutes played per title at the start of the session. Persisted so that, after a
+    // restart/crash without a clean stop, the added playtime can still be computed.
+    public Dictionary<string, MultiSpoofBaselineEntry> StartMinutes { get; set; } = new();
+}
+
+public class MultiSpoofBaselineEntry
+{
+    public string Name { get; set; } = "";
+    public int Minutes { get; set; }
 }
 
 // Estado persistido do Auto-Unlock (Documents\XAU\autounlock_state.json).

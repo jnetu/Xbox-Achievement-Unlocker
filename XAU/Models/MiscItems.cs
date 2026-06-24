@@ -12,7 +12,9 @@
         public string Name { get; set; }
         public string ImageUrl { get; set; }
         public string Gamerscore { get; set; }
-        public string TimePlayed { get; set; }
+
+        // Observable so the live heartbeat can refresh the displayed total playtime as it grows.
+        [ObservableProperty] private string _timePlayed;
 
         [ObservableProperty] private string _spoofingDuration = "00:00:00";
 

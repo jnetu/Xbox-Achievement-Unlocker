@@ -45,6 +45,11 @@ namespace XAU.ViewModels.Pages
         private readonly Random _rng = new Random();
         private bool _autoUnlockResumeTried = false;
 
+        // Captured when Auto-Unlock starts so the loop can still unlock the right title even if
+        // AchievementResponse changes (user opens another game) during the long countdown.
+        private string _autoUnlockServiceConfigId = "";
+        private string _autoUnlockTitleAssocId = "";
+
         private static string AutoUnlockStatePath =>
             Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.MyDocuments), "XAU", "autounlock_state.json");
 
@@ -58,7 +63,9 @@ namespace XAU.ViewModels.Pages
 
         private GameTitle GameInfoResponse = new GameTitle();
         // TODO: this needs to be updated if language changes
-        private Lazy<XboxRestAPI> _xboxRestAPI = new Lazy<XboxRestAPI>(() => new XboxRestAPI(HomeViewModel.XAUTH));
+        // Provider-based: the cached instance always reads the *current* token, so unlocks
+        // that fire 60-120 min later (after a token refresh) don't 401 on a stale token.
+        private Lazy<XboxRestAPI> _xboxRestAPI = new Lazy<XboxRestAPI>(() => new XboxRestAPI(() => HomeViewModel.XAUTH));
 
         public static bool SpoofingUpdate = false;
         private bool IsFiltered = false;
@@ -710,6 +717,14 @@ namespace XAU.ViewModels.Pages
             DGAchievements.Clear();
             foreach (var a in sorted) DGAchievements.Add(a);
 
+            // Capture the identifiers needed to unlock now, while AchievementResponse is valid.
+            if (!IsEventBased && AchievementResponse?.achievements?.Any() == true
+                && AchievementResponse.achievements[0].titleAssociations?.Any() == true)
+            {
+                _autoUnlockServiceConfigId = AchievementResponse.achievements[0].serviceConfigId;
+                _autoUnlockTitleAssocId = AchievementResponse.achievements[0].titleAssociations[0].id;
+            }
+
             IsAutoUnlocking = true;
             AutoUnlockButtonText = "Stop Auto-Unlock";
             AutoUnlockConfigEnabled = false;
@@ -748,12 +763,28 @@ namespace XAU.ViewModels.Pages
 
                 if (ct.IsCancellationRequested) break;
 
-                System.Windows.Application.Current.Dispatcher.Invoke(() =>
+                // Await the unlock instead of fire-and-forget, and retry a few times. This is the
+                // core fix: previously the unlock ran as async-void inside Dispatcher.Invoke, so a
+                // failure (e.g. stale-token 401) was never observed and the loop just restarted the
+                // next timer without ever unlocking — exactly the reported symptom.
+                bool unlocked = false;
+                for (int attempt = 1; attempt <= 3 && !unlocked && !ct.IsCancellationRequested; attempt++)
                 {
-                    int index = DGAchievements.IndexOf(achievement);
-                    if (index >= 0 && DGAchievements[index].IsUnlockable)
-                        UnlockAchievement(index);
-                });
+                    unlocked = await TryAutoUnlockAsync(achievement, ct);
+                    if (!unlocked && !ct.IsCancellationRequested)
+                    {
+                        try { await Task.Delay(TimeSpan.FromSeconds(10), ct); }
+                        catch (TaskCanceledException) { return; }
+                    }
+                }
+
+                if (!unlocked && !ct.IsCancellationRequested)
+                {
+                    System.Windows.Application.Current.Dispatcher.Invoke(() =>
+                        _snackbarService.Show("Auto-Unlock",
+                            $"Could not unlock \"{achievement.Name}\" (skipped). Check your login/token.",
+                            ControlAppearance.Caution, new SymbolIcon(SymbolRegular.Warning24), _snackbarDuration));
+                }
             }
 
             System.Windows.Application.Current.Dispatcher.Invoke(() =>
@@ -771,6 +802,59 @@ namespace XAU.ViewModels.Pages
                         ControlAppearance.Success, new SymbolIcon(SymbolRegular.Checkmark24), _snackbarDuration);
                 }
             });
+        }
+
+        // Performs a single auto-unlock off the UI thread and reports whether it actually succeeded.
+        // Title-based achievements are unlocked directly via the API using the identifiers captured
+        // at start (so a rebuilt DGAchievements collection can't break it); event-based titles reuse
+        // the existing UnlockAchievement path, which handles the events token / request body.
+        private async Task<bool> TryAutoUnlockAsync(AchievementsViewModel.DGAchievement achievement, CancellationToken ct)
+        {
+            if (achievement == null || !achievement.IsUnlockable) return false;
+
+            try
+            {
+                if (IsEventBased)
+                {
+                    var tcs = new TaskCompletionSource<bool>();
+                    System.Windows.Application.Current.Dispatcher.Invoke(() =>
+                    {
+                        int idx = DGAchievements.IndexOf(achievement);
+                        if (idx >= 0 && DGAchievements[idx].IsUnlockable)
+                        {
+                            UnlockAchievement(idx);
+                            tcs.SetResult(true);
+                        }
+                        else tcs.SetResult(false);
+                    });
+                    return await tcs.Task;
+                }
+
+                if (string.IsNullOrWhiteSpace(_autoUnlockServiceConfigId) ||
+                    string.IsNullOrWhiteSpace(_autoUnlockTitleAssocId))
+                    return false;
+
+                await _xboxRestAPI.Value.UnlockTitleBasedAchievementAsync(
+                    _autoUnlockServiceConfigId, _autoUnlockTitleAssocId, HomeViewModel.XUIDOnly,
+                    achievement.ID.ToString(), HomeViewModel.Settings.FakeSignatureEnabled);
+
+                System.Windows.Application.Current.Dispatcher.Invoke(() =>
+                {
+                    achievement.IsUnlockable = false;
+                    achievement.ProgressState = StringConstants.Achieved;
+                    achievement.DateUnlocked = DateTime.Now;
+                    if (!_unlockedAchievements.ContainsKey(achievement.ID))
+                        _unlockedAchievements.Add(achievement.ID, achievement);
+                    CollectionViewSource.GetDefaultView(DGAchievements).Refresh();
+                    _snackbarService.Show("Achievement Unlocked", $"{achievement.Name} has been unlocked",
+                        ControlAppearance.Success, new SymbolIcon(SymbolRegular.Checkmark24), _snackbarDuration);
+                });
+                return true;
+            }
+            catch
+            {
+                return false;
+            }
         }
 
         private void StartCountdownTimer()
@@ -856,7 +940,16 @@ namespace XAU.ViewModels.Pages
             System.Windows.Application.Current.Dispatcher.Invoke(() =>
             {
                 if (!IsAutoUnlocking && DGAchievements.Any(a => a.IsUnlockable))
-                    ToggleAutoUnlock();
+                {
+                    ToggleAutoUnlock(); // sorts DGAchievements by RarityPercentage desc
+
+                    // Mark as initialized so that, when the Achievements page is opened later,
+                    // OnNavigatedTo does NOT call InitializeViewModel()/LoadAchievements again — that
+                    // reload rebuilds the list in ID order and undid the rarity-percentage sort (the list
+                    // showed in ID order until the user manually stopped/started). Keeps the unlock order.
+                    IsInitialized = true;
+                    NewGame = false;
+                }
             });
         }
 
