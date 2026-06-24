@@ -474,6 +474,11 @@ namespace XAU.ViewModels.Pages
                 }
             }
 
+            // Guard against duplicate rows when more than one load populated the grid (e.g. the
+            // startup auto-resume racing with page navigation, where each pass clears before its
+            // await and then all of them add). Keep the first row per achievement ID.
+            RemoveDuplicateDGAchievements();
+
             if (IsSelectedGame360)
             {
                 _snackbarService.Show("Warning: Unsupported Game", $"This tool does not/will not support Xbox 360 titles. To unlock 360 achievements, you can try https://www.wemod.com/horizon", ControlAppearance.Caution,
@@ -522,6 +527,21 @@ namespace XAU.ViewModels.Pages
                 IsUnlockAllEnabled = Unlockable;
             else
                 IsUnlockAllEnabled = false;
+        }
+
+        // Removes duplicate achievement rows (same ID), keeping the first occurrence and preserving
+        // order. A safety net in case more than one populate pass ran into the same collection.
+        private void RemoveDuplicateDGAchievements()
+        {
+            var seen = new HashSet<int>();
+            int i = 0;
+            while (i < DGAchievements.Count)
+            {
+                if (seen.Add(DGAchievements[i].ID))
+                    i++;
+                else
+                    DGAchievements.RemoveAt(i);
+            }
         }
 
         public async void UnlockAchievement(int AchievementIndex)
@@ -932,24 +952,24 @@ namespace XAU.ViewModels.Pages
             AutoUnlockMinMinutes = state.MinMinutes;
             AutoUnlockMaxMinutes = state.MaxMinutes;
             TitleIDOverride = state.TitleId;
-            Unlockable = true; // estava em auto-unlock -> habilita para a fila nao vir vazia
+            Unlockable = true; // was auto-unlocking -> enable so the queue isn't empty
+
+            // Mark initialized up-front (synchronously, before the awaits below) so that if the user
+            // navigates to the Achievements page while this resume is still loading, OnNavigatedTo does
+            // NOT kick off a second, concurrent InitializeViewModel()/LoadAchievements — concurrent
+            // loads each clear-then-add and stack duplicate rows in the grid.
+            IsInitialized = true;
+            NewGame = false;
 
             await LoadGameInfo();
             await LoadAchievements();
 
+            // ToggleAutoUnlock sorts DGAchievements by RarityPercentage desc; because IsInitialized was
+            // set above, navigating to the Achievements page won't reload and reset that order back to ID.
             System.Windows.Application.Current.Dispatcher.Invoke(() =>
             {
                 if (!IsAutoUnlocking && DGAchievements.Any(a => a.IsUnlockable))
-                {
-                    ToggleAutoUnlock(); // sorts DGAchievements by RarityPercentage desc
-
-                    // Mark as initialized so that, when the Achievements page is opened later,
-                    // OnNavigatedTo does NOT call InitializeViewModel()/LoadAchievements again — that
-                    // reload rebuilds the list in ID order and undid the rarity-percentage sort (the list
-                    // showed in ID order until the user manually stopped/started). Keeps the unlock order.
-                    IsInitialized = true;
-                    NewGame = false;
-                }
+                    ToggleAutoUnlock();
             });
         }
 
