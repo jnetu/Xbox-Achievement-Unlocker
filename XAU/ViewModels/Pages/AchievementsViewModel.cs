@@ -49,6 +49,11 @@ namespace XAU.ViewModels.Pages
         // AchievementResponse changes (user opens another game) during the long countdown.
         private string _autoUnlockServiceConfigId = "";
         private string _autoUnlockTitleAssocId = "";
+        // Snapshot of the title and its kind at start. The loop MUST use these (not the live
+        // IsEventBased/TitleIDOverride, which change as the user navigates) so it never switches
+        // code paths mid-session and unlocks a different game with stale identifiers.
+        private string _autoUnlockTitleId = "0";
+        private bool _autoUnlockIsEventBased = false;
 
         private static string AutoUnlockStatePath =>
             Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.MyDocuments), "XAU", "autounlock_state.json");
@@ -754,6 +759,15 @@ namespace XAU.ViewModels.Pages
             DGAchievements.Clear();
             foreach (var a in sorted) DGAchievements.Add(a);
 
+            // Snapshot the title + kind so the background loop is pinned to THIS game regardless of
+            // any navigation the user does during the countdown.
+            _autoUnlockTitleId = TitleIDOverride;
+            _autoUnlockIsEventBased = IsEventBased;
+            // Reset captured title-based identifiers so a stale value from a previous (title-based)
+            // session can never be reused by a different game.
+            _autoUnlockServiceConfigId = "";
+            _autoUnlockTitleAssocId = "";
+
             // Capture the identifiers needed to unlock now, while AchievementResponse is valid.
             if (!IsEventBased && AchievementResponse?.achievements?.Any() == true
                 && AchievementResponse.achievements[0].titleAssociations?.Any() == true)
@@ -851,8 +865,17 @@ namespace XAU.ViewModels.Pages
 
             try
             {
-                if (IsEventBased)
+                // Use the snapshot taken at start, NOT the live IsEventBased (which flips as the user
+                // navigates) -- otherwise the loop could switch to the title-based path and reuse a
+                // stale serviceConfigId, unlocking a completely different game.
+                if (_autoUnlockIsEventBased)
                 {
+                    // Event-based unlocking needs the live page state (events data / request body), so
+                    // it can only run while the captured game is still the one on screen. If the user
+                    // navigated away, skip rather than risk unlocking the wrong (currently shown) game.
+                    if (TitleIDOverride != _autoUnlockTitleId)
+                        return false;
+
                     var tcs = new TaskCompletionSource<bool>();
                     System.Windows.Application.Current.Dispatcher.Invoke(() =>
                     {
