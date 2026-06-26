@@ -23,6 +23,9 @@ namespace XAU.ViewModels.Pages
         private TimeSpan _snackbarDuration = TimeSpan.FromSeconds(2);
         private Lazy<XboxRestAPI> _xboxRestAPI = new Lazy<XboxRestAPI>(() => new XboxRestAPI(() => HomeViewModel.XAUTH));
 
+        // Spoof/presence calls need the presence-capable token (SpoofXAUTH); reads keep using XAUTH.
+        private static XboxRestAPI GetSpoofApi() => new XboxRestAPI(() => XboxRestAPI.GetSpoofAuth());
+
 
 
         public MiscViewModel(ISnackbarService snackbarService)
@@ -87,7 +90,7 @@ namespace XAU.ViewModels.Pages
                 GameImage = "pack://application:,,,/Assets/cirno.png";
                 GameTime = "Time Played: ";
                 HomeViewModel.SpoofingStatus = 0;
-                await _xboxRestAPI.Value.StopHeartbeatAsync(HomeViewModel.XUIDOnly);
+                await GetSpoofApi().StopHeartbeatAsync(HomeViewModel.XUIDOnly);
                 return;
             }
             HomeViewModel.SpoofedTitleID = NewSpoofingID;
@@ -168,9 +171,18 @@ namespace XAU.ViewModels.Pages
         {
             Stopwatch stopwatch = new Stopwatch();
             stopwatch.Start();
-            TimeSpan spoofingTime = stopwatch.Elapsed;
-            SpoofingText = $"Spoofing {GameName} For: {spoofingTime.ToString(@"hh\:mm\:ss")}";
-            await _xboxRestAPI.Value.SendHeartbeatAsync(HomeViewModel.XUIDOnly, CurrentSpoofingID);
+            SpoofingText = $"Spoofing {GameName} For: {stopwatch.Elapsed:hh\\:mm\\:ss}";
+
+            // Try to (re)grab a presence-capable token from the Xbox app first (OAuth tokens 403).
+            await HomeViewModel.TryRefreshSpoofTokenFromXboxAppAsync();
+
+            var spoofResult = await GetSpoofApi().SendSpoofAsync(HomeViewModel.XUIDOnly, CurrentSpoofingID);
+            if (!spoofResult.Success)
+            {
+                ReportSpoofFailure(spoofResult);
+                return;
+            }
+
             var i = 0;
             Thread.Sleep(1000);
             SpoofingUpdate = false;
@@ -178,7 +190,12 @@ namespace XAU.ViewModels.Pages
             {
                 if (i == 300)
                 {
-                    await _xboxRestAPI.Value.SendHeartbeatAsync(HomeViewModel.XUIDOnly, CurrentSpoofingID);
+                    var refreshResult = await GetSpoofApi().SendSpoofAsync(HomeViewModel.XUIDOnly, CurrentSpoofingID);
+                    if (!refreshResult.Success)
+                    {
+                        ReportSpoofFailure(refreshResult);
+                        break;
+                    }
                     i = 0;
                 }
                 else
@@ -189,12 +206,33 @@ namespace XAU.ViewModels.Pages
                         HomeViewModel.SpoofedTitleID = "0";
                         break;
                     }
-                    spoofingTime = stopwatch.Elapsed;
-                    SpoofingText = $"Spoofing {GameInfoResponse.Titles[0].Name} For: {spoofingTime.ToString(@"hh\:mm\:ss")}";
+                    SpoofingText = $"Spoofing {GameInfoResponse.Titles[0].Name} For: {stopwatch.Elapsed:hh\\:mm\\:ss}";
                     i++;
                 }
                 Thread.Sleep(1000);
             }
+        }
+
+        // Resets the single-spoof UI and shows the API error, with a hint for the common 403 case.
+        private void ReportSpoofFailure(SpoofResult result)
+        {
+            SpoofingUpdate = true;
+            CurrentlySpoofing = false;
+            SpoofingButtonText = "Start Spoofing";
+            SpoofingText = "Spoofing Not Started";
+            HomeViewModel.SpoofingStatus = 0;
+            HomeViewModel.SpoofedTitleID = "0";
+
+            var detail = result.Error ?? "Unknown error";
+            if (detail.Contains("403"))
+                detail = "Xbox rejected the spoof (403). Open the Xbox app and wait until Home shows 'Attached' (green), then try again.";
+            if (detail.Length > 180)
+                detail = detail[..180] + "...";
+
+            System.Windows.Application.Current.Dispatcher.Invoke(() =>
+                _snackbarService.Show("Spoofing failed", detail,
+                    ControlAppearance.Danger,
+                    new SymbolIcon(SymbolRegular.ErrorCircle24), TimeSpan.FromSeconds(5)));
         }
 
         #endregion
@@ -234,7 +272,7 @@ namespace XAU.ViewModels.Pages
                 SaveMultiSpoofState(false, new List<string>());
                 System.Windows.Application.Current.Dispatcher.Invoke(() => MultiSpoofGames.Clear());
                 lock (_multiStateLock) _multiSessionStartMinutes.Clear();
-                await _multiXboxRestAPI.Value.StopHeartbeatAsync(HomeViewModel.XUIDOnly);
+                await GetSpoofApi().StopHeartbeatAsync(HomeViewModel.XUIDOnly);
                 return;
             }
 
@@ -347,7 +385,16 @@ namespace XAU.ViewModels.Pages
         private async Task MultiSpoofingLoop(List<string> titleIds)
         {
             var stopwatch = Stopwatch.StartNew();
-            await _multiXboxRestAPI.Value.SendHeartbeatAsync(HomeViewModel.XUIDOnly, titleIds);
+
+            // Try to grab a presence-capable token from the Xbox app first (OAuth tokens 403).
+            await HomeViewModel.TryRefreshSpoofTokenFromXboxAppAsync();
+
+            var firstResult = await GetSpoofApi().SendSpoofAsync(HomeViewModel.XUIDOnly, titleIds);
+            if (!firstResult.Success)
+            {
+                ReportMultiSpoofFailure(firstResult);
+                return;
+            }
             int i = 0;
             _multiSpoofingUpdate = false;
             Thread.Sleep(1000);
@@ -355,7 +402,12 @@ namespace XAU.ViewModels.Pages
             {
                 if (i == 300)
                 {
-                    await _multiXboxRestAPI.Value.SendHeartbeatAsync(HomeViewModel.XUIDOnly, titleIds);
+                    var refreshResult = await GetSpoofApi().SendSpoofAsync(HomeViewModel.XUIDOnly, titleIds);
+                    if (!refreshResult.Success)
+                    {
+                        ReportMultiSpoofFailure(refreshResult);
+                        break;
+                    }
                     await UpdateLiveDeltasAsync(titleIds);   // re-fetch playtime and show "+X min" live
                     SaveMultiSpoofState(true, titleIds);     // heartbeat -> refresh lastSavedAtUtc
                     i = 0;
@@ -376,6 +428,29 @@ namespace XAU.ViewModels.Pages
                 }
                 Thread.Sleep(1000);
             }
+        }
+
+        // Stops the multi-spoof loop and reports the API error (with a hint for the common 403 case).
+        private void ReportMultiSpoofFailure(SpoofResult result)
+        {
+            _multiSpoofingUpdate = true;
+            _multiCurrentlySpoofing = false;
+            HomeViewModel.SpoofingStatus = 0;
+
+            var detail = result.Error ?? "Unknown error";
+            if (detail.Contains("403"))
+                detail = "Xbox rejected the spoof (403). Open the Xbox app and wait until Home shows 'Attached' (green), then try again.";
+            if (detail.Length > 180)
+                detail = detail[..180] + "...";
+
+            System.Windows.Application.Current.Dispatcher.Invoke(() =>
+            {
+                MultiSpoofingButtonText = "Start Multi-Spoof";
+                MultiSpoofingStatusText = "Multi-Spoofing Not Started";
+                _snackbarService.Show("Multi-Spoofing failed", detail,
+                    ControlAppearance.Danger,
+                    new SymbolIcon(SymbolRegular.ErrorCircle24), TimeSpan.FromSeconds(5));
+            });
         }
 
         // ---- Persistencia de estado / historico / auto-retomada (padrao ScannerViewModel) ----

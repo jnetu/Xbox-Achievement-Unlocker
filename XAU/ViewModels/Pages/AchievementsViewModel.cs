@@ -67,6 +67,9 @@ namespace XAU.ViewModels.Pages
         // that fire 60-120 min later (after a token refresh) don't 401 on a stale token.
         private Lazy<XboxRestAPI> _xboxRestAPI = new Lazy<XboxRestAPI>(() => new XboxRestAPI(() => HomeViewModel.XAUTH));
 
+        // Spoof/presence calls need the presence-capable token (SpoofXAUTH); reads keep using XAUTH.
+        private static XboxRestAPI GetSpoofApi() => new XboxRestAPI(() => XboxRestAPI.GetSpoofAuth());
+
         public static bool SpoofingUpdate = false;
         private bool IsFiltered = false;
         private bool IsEventBased = false;
@@ -239,7 +242,16 @@ namespace XAU.ViewModels.Pages
 
         public async Task Spoofing()
         {
-            await _xboxRestAPI.Value.SendHeartbeatAsync(HomeViewModel.XUIDOnly, HomeViewModel.AutoSpoofedTitleID);
+            // Spoof/presence needs the presence-capable token; try the Xbox app first (OAuth 403s).
+            await HomeViewModel.TryRefreshSpoofTokenFromXboxAppAsync();
+
+            var spoofResult = await GetSpoofApi().SendSpoofAsync(HomeViewModel.XUIDOnly, HomeViewModel.AutoSpoofedTitleID);
+            if (!spoofResult.Success)
+            {
+                SpoofingUpdate = true;
+                return;
+            }
+
             var i = 0;
             Thread.Sleep(1000);
             SpoofingUpdate = false;
@@ -247,7 +259,12 @@ namespace XAU.ViewModels.Pages
             {
                 if (i == 300)
                 {
-                    await _xboxRestAPI.Value.SendHeartbeatAsync(HomeViewModel.XUIDOnly, HomeViewModel.AutoSpoofedTitleID);
+                    var refreshResult = await GetSpoofApi().SendSpoofAsync(HomeViewModel.XUIDOnly, HomeViewModel.AutoSpoofedTitleID);
+                    if (!refreshResult.Success)
+                    {
+                        SpoofingUpdate = true;
+                        break;
+                    }
                     i = 0;
                 }
                 else
