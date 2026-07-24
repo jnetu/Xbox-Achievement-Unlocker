@@ -261,44 +261,86 @@ public class XboxRestAPI
 
     private async Task<SpoofResult> PostSpoofAsync(string url, string requestBody, string apiName)
     {
-        var response = await _spooferClient.PostAsync(url, new StringContent(requestBody, Encoding.UTF8, HeaderValues.Accept));
-        var responseBody = await response.Content.ReadAsStringAsync();
+        HttpResponseMessage response;
+        string responseBody;
+        try
+        {
+            response = await _spooferClient.PostAsync(url, new StringContent(requestBody, Encoding.UTF8, HeaderValues.Accept));
+            responseBody = await response.Content.ReadAsStringAsync();
+        }
+        catch (Exception ex)
+        {
+            // A network blip used to escape all the way out of the spoofing loop and silently kill
+            // the session. Report it as a normal failure so the caller can just retry.
+            return SpoofResult.Fail($"{apiName} request failed: {ex.Message}");
+        }
 #if DEBUG
         Console.WriteLine($"{apiName} {(int)response.StatusCode} {response.StatusCode}: {responseBody}");
 #endif
-        return response.IsSuccessStatusCode
-            ? SpoofResult.Ok()
-            : SpoofResult.Fail($"{apiName} {(int)response.StatusCode} {response.StatusCode}: {responseBody}");
+        if (response.IsSuccessStatusCode)
+            return SpoofResult.Ok();
+
+        var authRejected = response.StatusCode is HttpStatusCode.Unauthorized or HttpStatusCode.Forbidden;
+        return SpoofResult.Fail($"{apiName} {(int)response.StatusCode} {response.StatusCode}: {responseBody}", authRejected);
+    }
+
+    private const int HeartbeatExpirationSeconds = 600;
+
+    // The heartbeat body takes a *list* of titles: everything in it stays active on the device at the
+    // same time. This is what lets several games accrue playtime in parallel.
+    private static string BuildHeartbeatBody(IEnumerable<ulong> titleIds) =>
+        "{\"titles\":[" + string.Join(",", titleIds.Select(id =>
+            $"{{\"expiration\":{HeartbeatExpirationSeconds},\"id\":{id},\"state\":\"active\",\"sandbox\":\"RETAIL\"}}")) + "]}";
+
+    private static List<ulong> ParseTitleIds(IEnumerable<string>? titleIds)
+    {
+        var parsed = new List<ulong>();
+        if (titleIds == null)
+            return parsed;
+
+        foreach (var raw in titleIds)
+        {
+            if (ulong.TryParse(raw?.Trim(), out var id) && !parsed.Contains(id))
+                parsed.Add(id);
+        }
+        return parsed;
     }
 
     public async Task<SpoofResult> SendHeartbeatAsync(string xuid, string spoofedTitleId)
     {
-        spoofedTitleId = spoofedTitleId?.Trim() ?? "";
-        if (string.IsNullOrWhiteSpace(xuid) || string.IsNullOrWhiteSpace(spoofedTitleId))
+        if (string.IsNullOrWhiteSpace(xuid))
             return SpoofResult.Fail("Missing XUID or Title ID.");
-        if (string.IsNullOrWhiteSpace(Xauth))
-            return SpoofResult.Fail("Missing XAUTH token. Log in again.");
-        if (!ulong.TryParse(spoofedTitleId, out var titleId))
-            return SpoofResult.Fail("Title ID must be numeric.");
-
-        SetHeartbeatHeaders();
-        var requestBody = $"{{\"titles\":[{{\"expiration\":600,\"id\":{titleId},\"state\":\"active\",\"sandbox\":\"RETAIL\"}}]}}";
-        return await PostSpoofAsync(string.Format(InterpolatedXboxAPIUrls.HeartbeatUrl, xuid), requestBody, "Heartbeat");
+        return await SendHeartbeatAsync(xuid, ParseTitleIds(new[] { spoofedTitleId }));
     }
 
     public async Task<SpoofResult> SendHeartbeatMeAsync(string spoofedTitleId)
     {
-        spoofedTitleId = spoofedTitleId?.Trim() ?? "";
-        if (string.IsNullOrWhiteSpace(spoofedTitleId))
-            return SpoofResult.Fail("Missing Title ID.");
+        return await SendHeartbeatMeAsync(ParseTitleIds(new[] { spoofedTitleId }));
+    }
+
+    // Registers every given title as active on the device in one request (multi-spoof).
+    public async Task<SpoofResult> SendHeartbeatAsync(string xuid, IReadOnlyList<ulong> titleIds)
+    {
+        if (string.IsNullOrWhiteSpace(xuid))
+            return SpoofResult.Fail("Missing XUID.");
         if (string.IsNullOrWhiteSpace(Xauth))
-            return SpoofResult.Fail("Missing XAUTH token. Log in again.");
-        if (!ulong.TryParse(spoofedTitleId, out var titleId))
+            return SpoofResult.Fail("Missing XAUTH token. Log in again.", authRejected: true);
+        if (titleIds == null || titleIds.Count == 0)
             return SpoofResult.Fail("Title ID must be numeric.");
 
         SetHeartbeatHeaders();
-        var requestBody = $"{{\"titles\":[{{\"expiration\":600,\"id\":{titleId},\"state\":\"active\",\"sandbox\":\"RETAIL\"}}]}}";
-        return await PostSpoofAsync(InterpolatedXboxAPIUrls.HeartbeatMeUrl, requestBody, "Heartbeat (me)");
+        return await PostSpoofAsync(string.Format(InterpolatedXboxAPIUrls.HeartbeatUrl, xuid), BuildHeartbeatBody(titleIds), "Heartbeat");
+    }
+
+    public async Task<SpoofResult> SendHeartbeatMeAsync(IReadOnlyList<ulong> titleIds)
+    {
+        if (string.IsNullOrWhiteSpace(Xauth))
+            return SpoofResult.Fail("Missing XAUTH token. Log in again.", authRejected: true);
+        if (titleIds == null || titleIds.Count == 0)
+            return SpoofResult.Fail("Title ID must be numeric.");
+
+        SetHeartbeatHeaders();
+        return await PostSpoofAsync(InterpolatedXboxAPIUrls.HeartbeatMeUrl, BuildHeartbeatBody(titleIds), "Heartbeat (me)");
     }
 
     public async Task<SpoofResult> SendPresenceAsync(string xuid, string spoofedTitleId)
@@ -334,7 +376,7 @@ public class XboxRestAPI
     public async Task<SpoofResult> SendSpoofAsync(string xuid, string spoofedTitleId)
     {
         if (string.IsNullOrWhiteSpace(Xauth))
-            return SpoofResult.Fail("Missing XAUTH token. Log in again.");
+            return SpoofResult.Fail("Missing XAUTH token. Log in again.", authRejected: true);
 
         var attempts = new List<SpoofResult>();
 
@@ -354,26 +396,64 @@ public class XboxRestAPI
         if (heartbeatMe.Success) return heartbeatMe;
         attempts.Add(heartbeatMe);
 
-        return SpoofResult.Fail(string.Join(" | ", attempts.Select(a => a.Error).Where(e => !string.IsNullOrWhiteSpace(e))));
+        return SpoofResult.Fail(
+            string.Join(" | ", attempts.Select(a => a.Error).Where(e => !string.IsNullOrWhiteSpace(e))),
+            attempts.Any(a => a.AuthRejected));
     }
 
-    // Multi-spoof: report every title; succeeds if at least one title was accepted.
-    public async Task<SpoofResult> SendSpoofAsync(string xuid, IEnumerable<string> titleIds)
+    // Multi-spoof: keeps *every* title active at the same time.
+    // The presence endpoint only takes one title per call, so each title is registered on its own;
+    // then a single heartbeat carrying the whole list is sent last, because the device's title list
+    // is what decides which games keep accruing playtime and it has to end up holding all of them.
+    // Sending one title per request (the previous behaviour) meant each call replaced the one before
+    // it, so only the last game in the list was ever really "playing".
+    public async Task<SpoofResult> SendSpoofAsync(string xuid, IReadOnlyList<string> titleIds)
     {
-        if (titleIds == null) return SpoofResult.Fail("No titles provided.");
+        if (string.IsNullOrWhiteSpace(Xauth))
+            return SpoofResult.Fail("Missing XAUTH token. Log in again.", authRejected: true);
+
+        var ids = ParseTitleIds(titleIds);
+        if (ids.Count == 0)
+            return SpoofResult.Fail("No valid (numeric) Title IDs provided.");
 
         var errors = new List<string>();
-        bool anySuccess = false;
-        foreach (var id in titleIds)
+        var authRejected = false;
+        var anyPresence = false;
+
+        foreach (var id in ids)
         {
-            if (string.IsNullOrWhiteSpace(id)) continue;
-            var result = await SendSpoofAsync(xuid, id);
-            if (result.Success) anySuccess = true;
-            else if (!string.IsNullOrWhiteSpace(result.Error)) errors.Add(result.Error!);
+            var presence = await SendPresenceAsync(xuid, id.ToString());
+            if (presence.Success) { anyPresence = true; continue; }
+            authRejected |= presence.AuthRejected;
+            errors.Add(presence.Error!);
+
+            var presenceMe = await SendPresenceMeAsync(id.ToString());
+            if (presenceMe.Success) { anyPresence = true; continue; }
+            authRejected |= presenceMe.AuthRejected;
+            errors.Add(presenceMe.Error!);
         }
 
-        if (anySuccess) return SpoofResult.Ok();
-        return errors.Count > 0 ? SpoofResult.Fail(string.Join(" | ", errors.Distinct())) : SpoofResult.Fail("No titles provided.");
+        // Last, so the device is left registered with the complete set of titles.
+        var heartbeat = await SendHeartbeatAsync(xuid, ids);
+        if (heartbeat.Success)
+            return SpoofResult.Ok(multiTitleAccepted: true);
+        authRejected |= heartbeat.AuthRejected;
+        errors.Add(heartbeat.Error!);
+
+        var heartbeatMe = await SendHeartbeatMeAsync(ids);
+        if (heartbeatMe.Success)
+            return SpoofResult.Ok(multiTitleAccepted: true);
+        authRejected |= heartbeatMe.AuthRejected;
+        errors.Add(heartbeatMe.Error!);
+
+        // Presence worked but the multi-title heartbeat didn't: the games are spoofing, just not
+        // guaranteed in parallel, so the caller rotates the order to keep them even.
+        if (anyPresence)
+            return SpoofResult.Ok(multiTitleAccepted: false);
+
+        return SpoofResult.Fail(
+            string.Join(" | ", errors.Where(e => !string.IsNullOrWhiteSpace(e)).Distinct()),
+            authRejected);
     }
 
     public async Task StopHeartbeatAsync(string xuid)

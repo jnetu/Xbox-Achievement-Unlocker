@@ -75,7 +75,18 @@ namespace XAU.ViewModels.Pages
         // Spoof/presence calls need the presence-capable token (SpoofXAUTH); reads keep using XAUTH.
         private static XboxRestAPI GetSpoofApi() => new XboxRestAPI(() => XboxRestAPI.GetSpoofAuth());
 
+        // Cached client for the auto-spoof loop: the token is resolved per request, so it stays valid
+        // across renewals instead of creating a new HttpClient on every cycle.
+        private static readonly Lazy<XboxRestAPI> _spoofApi = new(() => new XboxRestAPI(() => XboxRestAPI.GetSpoofAuth()));
+
+        // Presence lasts 600s, so refresh every 150s; a failed cycle retries sooner.
+        private static readonly TimeSpan SpoofRefreshInterval = TimeSpan.FromSeconds(150);
+        private static readonly TimeSpan SpoofRetryInterval = TimeSpan.FromSeconds(45);
+
         public static bool SpoofingUpdate = false;
+        // Identifies the running auto-spoof session, so a loop that has been superseded (user opened
+        // another game) or stopped while a send was in flight ends itself instead of living forever.
+        private static int _autoSpoofSession = 0;
         private bool IsFiltered = false;
         private bool IsEventBased = false;
         private dynamic EventsData = (dynamic)(new JObject());
@@ -225,7 +236,14 @@ namespace XAU.ViewModels.Pages
                     GameName = GameInfoResponse.Titles[0].Name;
                 }
 
-                await Task.Run(() => Spoofing());
+                var session = ++_autoSpoofSession;
+                await Task.Run(() => Spoofing(session));
+
+                // A newer session (user opened another game) already owns the spoof state: don't let
+                // this one tear it down, or the new loop would find AutoSpoofedTitleID cleared.
+                if (session != _autoSpoofSession)
+                    return;
+
                 if (HomeViewModel.SpoofingStatus == 1)
                 {
                     if (HomeViewModel.SpoofedTitleID == HomeViewModel.AutoSpoofedTitleID)
@@ -245,43 +263,41 @@ namespace XAU.ViewModels.Pages
 
         }
 
-        public async Task Spoofing()
+        // Auto-spoofer keep-alive. Like the other spoof loops it retries instead of giving up: the
+        // presence token expires after a few hours and a failed cycle used to end the session
+        // silently, so the game stopped counting playtime until the user restarted it by hand.
+        public async Task Spoofing(int session)
         {
-            // Spoof/presence needs the presence-capable token; try the Xbox app first (OAuth 403s).
-            await HomeViewModel.TryRefreshSpoofTokenFromXboxAppAsync();
+            bool Stopped() => SpoofingUpdate || session != _autoSpoofSession;
 
-            var spoofResult = await GetSpoofApi().SendSpoofAsync(HomeViewModel.XUIDOnly, HomeViewModel.AutoSpoofedTitleID);
-            if (!spoofResult.Success)
-            {
-                SpoofingUpdate = true;
-                return;
-            }
-
-            var i = 0;
-            Thread.Sleep(1000);
+            var titleId = HomeViewModel.AutoSpoofedTitleID;
+            var result = await SpoofSender.SendAsync(_spoofApi.Value, HomeViewModel.XUIDOnly, titleId);
+            if (session != _autoSpoofSession) return;
             SpoofingUpdate = false;
-            while (!SpoofingUpdate)
-            {
-                if (i == 300)
-                {
-                    var refreshResult = await GetSpoofApi().SendSpoofAsync(HomeViewModel.XUIDOnly, HomeViewModel.AutoSpoofedTitleID);
-                    if (!refreshResult.Success)
-                    {
-                        SpoofingUpdate = true;
-                        break;
-                    }
-                    i = 0;
-                }
-                else
-                {
-                    if (SpoofingUpdate)
-                    {
 
-                        break;
-                    }
-                    i++;
+            while (!Stopped())
+            {
+                var wait = result.Success ? SpoofRefreshInterval : SpoofRetryInterval;
+                var deadline = DateTime.UtcNow + wait;
+                while (DateTime.UtcNow < deadline)
+                {
+                    if (Stopped()) return;
+                    await Task.Delay(1000);
                 }
-                Thread.Sleep(1000);
+                if (Stopped()) return;
+
+                if (!HomeViewModel.IsSignedIn)
+                {
+                    result = SpoofResult.Fail("Waiting for the Xbox login to come back.");
+                    continue;
+                }
+
+                // The auto-spoofed title changes when the user opens another game's page.
+                titleId = HomeViewModel.AutoSpoofedTitleID;
+                if (string.IsNullOrWhiteSpace(titleId) || titleId == "0")
+                    return;
+
+                result = await SpoofSender.SendAsync(_spoofApi.Value, HomeViewModel.XUIDOnly, titleId);
             }
         }
 

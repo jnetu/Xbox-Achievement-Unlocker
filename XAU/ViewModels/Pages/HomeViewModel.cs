@@ -67,6 +67,10 @@ namespace XAU.ViewModels.Pages
         public static int SpoofingStatus = 0; //0 = NotSpoofing, 1 = Spoofing, 2 = AutoSpoofing
         public static string SpoofedTitleID = "0";
         public static string AutoSpoofedTitleID = "0";
+        // Multi-spoof doesn't go through SpoofingStatus (it isn't a single title), but the session
+        // keep-alive still has to run for it -- otherwise a long multi-spoof session never triggers
+        // an early token refresh and dies with the token.
+        public static bool MultiSpoofingActive = false;
 
         //SnackBar
         public HomeViewModel(ISnackbarService snackbarService, IContentDialogService contentDialogService)
@@ -113,6 +117,14 @@ namespace XAU.ViewModels.Pages
         // Presence-capable token used only for spoofing (from the Xbox app scan or a userpresence
         // XSTS). The normal XAUTH 403s on the presence endpoint; falls back to XAUTH when unset.
         public static string SpoofXAUTH = "";
+
+        // The spoof token expires after a few hours. Spoofing sessions renew it on their own (see
+        // EnsureSpoofTokenFreshAsync) instead of dying once the token captured at login goes stale.
+        private static readonly TimeSpan SpoofTokenMaxAge = TimeSpan.FromHours(2);
+        private static readonly TimeSpan SpoofTokenRetryThrottle = TimeSpan.FromMinutes(2);
+        private static readonly SemaphoreSlim SpoofTokenLock = new(1, 1);
+        private static DateTime _spoofTokenObtainedAtUtc = DateTime.MinValue;
+        private static DateTime _spoofTokenLastAttemptUtc = DateTime.MinValue;
         public static string XUIDOnly;
         public static bool InitComplete = false;
         private bool _isInitialized = false;
@@ -561,7 +573,86 @@ namespace XAU.ViewModels.Pages
                 }
 
                 SpoofXAUTH = token;
+                _spoofTokenObtainedAtUtc = DateTime.UtcNow;
                 return true;
+            }
+            catch
+            {
+                return false;
+            }
+        }
+
+        public static DateTime SpoofTokenObtainedAtUtc => _spoofTokenObtainedAtUtc;
+
+        // Static view of the login state for the background loops: the generated IsLoggedIn property
+        // is an instance member even though its backing field is static.
+        public static bool IsSignedIn => _isLoggedIn && !string.IsNullOrWhiteSpace(XUIDOnly);
+
+        private static bool IsSpoofTokenFresh() =>
+            !string.IsNullOrWhiteSpace(SpoofXAUTH)
+            && _spoofTokenObtainedAtUtc != DateTime.MinValue
+            && DateTime.UtcNow - _spoofTokenObtainedAtUtc < SpoofTokenMaxAge;
+
+        /// <summary>
+        /// Makes sure the presence token used for spoofing is recent, renewing it when it isn't.
+        /// Tries the running Xbox app first (its token is the one that reliably works for presence),
+        /// then rebuilds a presence-scoped XSTS from the saved OAuth session.
+        /// Called before every spoof send, and again with <paramref name="force"/> when the API
+        /// rejects the token -- without this a session dies as soon as the token ages out (~8-10h).
+        /// </summary>
+        public static async Task<bool> EnsureSpoofTokenFreshAsync(bool force = false)
+        {
+            if (!force && IsSpoofTokenFresh())
+                return true;
+
+            await SpoofTokenLock.WaitAsync();
+            try
+            {
+                // Another caller may have renewed it while we waited on the lock.
+                if (!force && IsSpoofTokenFresh())
+                    return true;
+
+                // The memory scan and the token rebuild are expensive, so don't repeat them on every
+                // cycle while they keep failing (e.g. Xbox app closed and no OAuth session).
+                if (DateTime.UtcNow - _spoofTokenLastAttemptUtc < SpoofTokenRetryThrottle)
+                    return false;
+                _spoofTokenLastAttemptUtc = DateTime.UtcNow;
+
+                if (await TryRefreshSpoofTokenFromXboxAppAsync())
+                    return true;
+
+                var home = App.GetService<HomeViewModel>();
+                if (home != null && await home.TryRebuildSpoofTokenFromOAuthAsync())
+                    return true;
+
+                return false;
+            }
+            catch
+            {
+                return false;
+            }
+            finally
+            {
+                SpoofTokenLock.Release();
+            }
+        }
+
+        // Renews the OAuth session silently and rebuilds both XAUTH and the presence-scoped
+        // SpoofXAUTH from it. Token-only (no UI work) so it is safe to call from the spoof loops.
+        private async Task<bool> TryRebuildSpoofTokenFromOAuthAsync()
+        {
+            if (!Settings.OAuthLogin || oauth == null || xboxSignedClient == null)
+                return false;
+
+            try
+            {
+                var session = readSession();
+                if (string.IsNullOrEmpty(session?.RefreshToken))
+                    return false;
+
+                var response = await oauth.AuthenticateSilently(session.RefreshToken!);
+                writeSession(response);
+                return await BuildTokensFromResponseAsync(response);
             }
             catch
             {
@@ -579,6 +670,7 @@ namespace XAU.ViewModels.Pages
 
             XAUTH = token;
             SpoofXAUTH = token;
+            _spoofTokenObtainedAtUtc = DateTime.UtcNow;
             XAUTHTested = false;
         }
         private bool _testingXauth = false;
@@ -608,7 +700,11 @@ namespace XAU.ViewModels.Pages
                 XAUTHTested = true;
                 InitComplete = true;
                 // Manually-tested/pasted token: use it for spoofing too (best effort).
-                if (string.IsNullOrWhiteSpace(SpoofXAUTH)) SpoofXAUTH = XAUTH;
+                if (string.IsNullOrWhiteSpace(SpoofXAUTH))
+                {
+                    SpoofXAUTH = XAUTH;
+                    _spoofTokenObtainedAtUtc = DateTime.UtcNow;
+                }
 
                 // Start the events token worker to periodically check/refresh the token
                 if (Settings.AutoGrabEventsToken && !EventsTokenWorker.IsBusy)
@@ -979,6 +1075,9 @@ namespace XAU.ViewModels.Pages
             if (!_tokenRefreshTriggeredEarly && DateTime.UtcNow < _oauthTokenExpiresAt - OAuthRefreshThreshold)
                 return;
 
+            // Shares the lock with the spoof-token renewal: the refresh token rotates on use, so two
+            // silent authentications running at once would invalidate each other.
+            await SpoofTokenLock.WaitAsync();
             try
             {
                 var session = readSession();
@@ -998,6 +1097,10 @@ namespace XAU.ViewModels.Pages
                     IsLoggedIn = false;
                     _snackbarService.Show("Session expired", "Please log in again", ControlAppearance.Danger, new SymbolIcon(SymbolRegular.ErrorCircle24), _snackbarDuration);
                 });
+            }
+            finally
+            {
+                SpoofTokenLock.Release();
             }
         }
 
@@ -1037,7 +1140,7 @@ namespace XAU.ViewModels.Pages
             {
                 Thread.Sleep(KeepAliveInterval);
 
-                if (!Settings.SessionKeepAliveEnabled || !IsLoggedIn || SpoofingStatus == 0)
+                if (!Settings.SessionKeepAliveEnabled || !IsLoggedIn || (SpoofingStatus == 0 && !MultiSpoofingActive))
                     continue;
 
                 try
@@ -1150,7 +1253,10 @@ namespace XAU.ViewModels.Pages
             }
         }
 
-        private async void GenerateTokens(MicrosoftOAuthResponse response)
+        // Turns an OAuth response into the tokens the app uses: the normal XAUTH and the
+        // presence-scoped SpoofXAUTH. No UI work, so both the login flow and the background renewal
+        // (TryRebuildSpoofTokenFromOAuthAsync) can call it.
+        private async Task<bool> BuildTokensFromResponseAsync(MicrosoftOAuthResponse response)
         {
             var deviceToken = await xboxSignedClient.RequestDeviceToken(XboxDeviceTypes.Win32, "0.0.0");
             var sisuResult = await xboxSignedClient.SisuAuth(new XboxSisuAuthRequest
@@ -1160,20 +1266,32 @@ namespace XAU.ViewModels.Pages
                 DeviceToken = deviceToken.Token,
                 RelyingParty = XboxAuthConstants.XboxLiveRelyingParty,
             });
+
+            XAUTH = $"XBL3.0 x={sisuResult.AuthorizationToken.XuiClaims.UserHash};{sisuResult.AuthorizationToken.Token}";
+            // Presence-scoped token for spoofing (falls back to XAUTH if it can't be built).
+            SpoofXAUTH = await BuildSpoofXauthAsync(sisuResult, deviceToken.Token) ?? XAUTH;
+            _spoofTokenObtainedAtUtc = DateTime.UtcNow;
+            if (!string.IsNullOrEmpty(sisuResult.AuthorizationToken.ExpireOn)
+                && DateTime.TryParse(sisuResult.AuthorizationToken.ExpireOn, out var expiresAt))
+                _oauthTokenExpiresAt = expiresAt.ToUniversalTime();
+            else
+                _oauthTokenExpiresAt = DateTime.UtcNow.AddHours(23);
+
+            var claims = sisuResult.AuthorizationToken.XuiClaims;
+            XUIDOnly = claims?.XboxUserId ?? "";
+            _lastLoginClaims = claims;
+            return !string.IsNullOrEmpty(XUIDOnly);
+        }
+
+        private XboxAuthXuiClaims? _lastLoginClaims;
+
+        private async void GenerateTokens(MicrosoftOAuthResponse response)
+        {
             try
             {
-                XAUTH = $"XBL3.0 x={sisuResult.AuthorizationToken.XuiClaims.UserHash};{sisuResult.AuthorizationToken.Token}";
-                // Presence-scoped token for spoofing (falls back to XAUTH if it can't be built).
-                SpoofXAUTH = await BuildSpoofXauthAsync(sisuResult, deviceToken.Token) ?? XAUTH;
-                if (!string.IsNullOrEmpty(sisuResult.AuthorizationToken.ExpireOn)
-                    && DateTime.TryParse(sisuResult.AuthorizationToken.ExpireOn, out var expiresAt))
-                    _oauthTokenExpiresAt = expiresAt.ToUniversalTime();
-                else
-                    _oauthTokenExpiresAt = DateTime.UtcNow.AddHours(23);
-                var xui = sisuResult.AuthorizationToken.XuiClaims;
-                XUIDOnly = xui?.XboxUserId ?? "";
-                if (!string.IsNullOrEmpty(XUIDOnly))
+                if (await BuildTokensFromResponseAsync(response))
                 {
+                    var xui = _lastLoginClaims;
                     IsLoggedIn = true;
                     XAUTHTested = true;
                     InitComplete = true;
@@ -1279,6 +1397,8 @@ namespace XAU.ViewModels.Pages
             GrabbedProfile = false;
             XAUTH = "";
             SpoofXAUTH = "";
+            _spoofTokenObtainedAtUtc = DateTime.MinValue;
+            _spoofTokenLastAttemptUtc = DateTime.MinValue;
             XUIDOnly = "";
             GamerTag = "Gamertag: Unknown   ";
             Xuid = "XUID: Unknown";

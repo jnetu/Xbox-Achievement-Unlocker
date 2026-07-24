@@ -66,9 +66,20 @@ public readonly struct SpoofResult
     public bool Success { get; init; }
     public string? Error { get; init; }
 
-    public static SpoofResult Ok() => new() { Success = true };
+    // The API rejected the token (401/403). The caller renews the presence token and retries instead
+    // of killing the session -- this is what happens once the spoof token ages out mid-session.
+    public bool AuthRejected { get; init; }
 
-    public static SpoofResult Fail(string error) => new() { Success = false, Error = error };
+    // Every requested title was registered in a single call (multi-title heartbeat accepted), so all
+    // of them stay "active" at the same time. When false the caller rotates the title order so the
+    // playtime is at least spread evenly instead of piling up on one game.
+    public bool MultiTitleAccepted { get; init; }
+
+    public static SpoofResult Ok(bool multiTitleAccepted = false) =>
+        new() { Success = true, MultiTitleAccepted = multiTitleAccepted };
+
+    public static SpoofResult Fail(string error, bool authRejected = false) =>
+        new() { Success = false, Error = error, AuthRejected = authRejected };
 }
 
 public class GamepassProductsRequest
