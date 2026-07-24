@@ -31,6 +31,11 @@ namespace XAU.ViewModels.Pages
 
     public partial class HomeViewModel : ObservableObject, INavigationAware
     {
+        // Kept as the placeholder on purpose (upstream sets a real date version here, e.g. "26.06.14").
+        // Any real value turns the auto-updater on, and it downloads the *upstream* release over this
+        // executable -- which would wipe this fork's features (multi-spoofer, auto-unlock, spoof fix).
+        // It also keeps the Build-Release workflow from publishing releases from this fork.
+        // Only change this after pointing GithubRestApi.GetReleaseVersionAsync at this fork's releases.
         public static string ToolVersion = "EmptyDevToolVersion";
         public static string EventsVersion = "1.0";
 
@@ -200,6 +205,9 @@ namespace XAU.ViewModels.Pages
             else
             {
                 var jsonResponse = await _gitHubRestAPI.Value.GetReleaseVersionAsync();
+
+                if (jsonResponse.Count == 0)
+                    return;
 
                 if (jsonResponse[0].tag_name.ToString() != ToolVersion)
                 {
