@@ -23,6 +23,60 @@ namespace XAU.ViewModels.Pages
         private TimeSpan _snackbarDuration = TimeSpan.FromSeconds(2);
         private Lazy<XboxRestAPI> _xboxRestAPI = new Lazy<XboxRestAPI>(() => new XboxRestAPI(() => HomeViewModel.XAUTH));
 
+        // Spoof/presence calls need the presence-capable token (SpoofXAUTH); reads keep using XAUTH.
+        // Used for the one-shot calls (stop); the loops below use their own cached instance.
+        private static XboxRestAPI GetSpoofApi() => new XboxRestAPI(() => XboxRestAPI.GetSpoofAuth());
+
+        // One cached client per loop. The token is resolved per request, so the instance stays valid
+        // across token renewals, and a 10h session no longer churns a new HttpClient every cycle.
+        // Separate instances because both loops can run at once and each mutates its own headers.
+        private static readonly Lazy<XboxRestAPI> _singleSpoofApi = new(() => new XboxRestAPI(() => XboxRestAPI.GetSpoofAuth()));
+        private static readonly Lazy<XboxRestAPI> _multiSpoofApi = new(() => new XboxRestAPI(() => XboxRestAPI.GetSpoofAuth()));
+
+        // Presence stays valid for 600s (see the heartbeat body), so refreshing every 150s keeps every
+        // title continuously active with margin for a missed cycle; failures retry sooner.
+        private static readonly TimeSpan SpoofRefreshInterval = TimeSpan.FromSeconds(150);
+        private static readonly TimeSpan SpoofRetryInterval = TimeSpan.FromSeconds(45);
+        private static readonly TimeSpan LiveDeltaInterval = TimeSpan.FromMinutes(5);
+
+        // Sleeps in 1s slices, ticking the UI, and bails out as soon as the session is stopped.
+        // Returns true when the loop should stop.
+        private static async Task<bool> WaitWhileSpoofingAsync(TimeSpan interval, Func<bool> stopRequested, Action tick)
+        {
+            var deadline = DateTime.UtcNow + interval;
+            while (DateTime.UtcNow < deadline)
+            {
+                if (stopRequested()) return true;
+                try { System.Windows.Application.Current?.Dispatcher.Invoke(tick); } catch { }
+                await Task.Delay(1000);
+            }
+            return stopRequested();
+        }
+
+        private static string DescribeSpoofError(SpoofResult result)
+        {
+            var detail = result.Error ?? "Unknown error";
+            if (detail.Contains("403") || detail.Contains("401"))
+                detail = "Xbox rejected the spoof token. Open the Xbox app and wait until Home shows 'Attached' (green). Retrying automatically.";
+            if (detail.Length > 180)
+                detail = detail[..180] + "...";
+            return detail;
+        }
+
+        // A failed cycle no longer ends the session: warn on the first failure and then only now and
+        // then, while the loop keeps retrying. An expired token or a network drop recovers on its own.
+        private void NotifySpoofProblem(string title, SpoofResult result, int attempt)
+        {
+            if (attempt != 1 && attempt % 20 != 0)
+                return;
+
+            var detail = DescribeSpoofError(result);
+            System.Windows.Application.Current?.Dispatcher.Invoke(() =>
+                _snackbarService.Show(title, detail,
+                    ControlAppearance.Caution,
+                    new SymbolIcon(SymbolRegular.Warning24), TimeSpan.FromSeconds(5)));
+        }
+
 
 
         public MiscViewModel(ISnackbarService snackbarService)
@@ -73,6 +127,7 @@ namespace XAU.ViewModels.Pages
             if (CurrentlySpoofing)
             {
                 SpoofingUpdate = true;
+                _spoofSession++;
                 CurrentlySpoofing = false;
                 SpoofingText = "Spoofing Not Started";
                 SpoofingButtonText = "Start Spoofing";
@@ -87,7 +142,7 @@ namespace XAU.ViewModels.Pages
                 GameImage = "pack://application:,,,/Assets/cirno.png";
                 GameTime = "Time Played: ";
                 HomeViewModel.SpoofingStatus = 0;
-                await _xboxRestAPI.Value.StopHeartbeatAsync(HomeViewModel.XUIDOnly);
+                await GetSpoofApi().StopHeartbeatAsync(HomeViewModel.XUIDOnly);
                 return;
             }
             HomeViewModel.SpoofedTitleID = NewSpoofingID;
@@ -159,41 +214,63 @@ namespace XAU.ViewModels.Pages
             CurrentlySpoofing = true;
             SpoofingButtonText = "Stop Spoofing";
             SpoofingText = $"Spoofing {GameInfoResponse.Titles[0].Name}";
-            await Task.Run(() => Spoofing());
+            var session = ++_spoofSession;
+            await Task.Run(() => Spoofing(session));
 
         }
 
+        // Identifies the running session. Bumped on every start and stop so a loop can tell it has
+        // been superseded: the SpoofingUpdate flag alone isn't enough now that the loop clears it
+        // after its first send -- a Stop pressed while that send was in flight would be swallowed
+        // and the loop would keep spoofing forever.
+        private int _spoofSession = 0;
+
+        // Keeps one title marked as playing until the user stops it. The loop never ends on its own:
+        // a rejected token (it ages out after a few hours) or a network drop is retried -- previously
+        // any single failure broke out and left the user having to press Start again.
         // TODO: this code seems like it's duplicated in AchievementsViewModel.cs too.
-        public async Task Spoofing()
+        public async Task Spoofing(int session)
         {
-            Stopwatch stopwatch = new Stopwatch();
-            stopwatch.Start();
-            TimeSpan spoofingTime = stopwatch.Elapsed;
-            SpoofingText = $"Spoofing {GameName} For: {spoofingTime.ToString(@"hh\:mm\:ss")}";
-            await _xboxRestAPI.Value.SendHeartbeatAsync(HomeViewModel.XUIDOnly, CurrentSpoofingID);
-            var i = 0;
-            Thread.Sleep(1000);
+            var stopwatch = Stopwatch.StartNew();
+            var titleName = GameInfoResponse?.Titles?.FirstOrDefault()?.Name ?? CurrentSpoofingID;
+            var titleId = CurrentSpoofingID;
+            var failures = 0;
+            bool Stopped() => SpoofingUpdate || session != _spoofSession;
+
+            // The first send also releases any previous loop (SpoofGame set the flag before starting).
+            var result = await SpoofSender.SendAsync(_singleSpoofApi.Value, HomeViewModel.XUIDOnly, titleId);
+            if (session != _spoofSession) return;
             SpoofingUpdate = false;
-            while (!SpoofingUpdate)
+
+            while (!Stopped())
             {
-                if (i == 300)
+                if (result.Success)
                 {
-                    await _xboxRestAPI.Value.SendHeartbeatAsync(HomeViewModel.XUIDOnly, CurrentSpoofingID);
-                    i = 0;
+                    failures = 0;
                 }
                 else
                 {
-                    if (SpoofingUpdate)
-                    {
-                        HomeViewModel.SpoofingStatus = 0;
-                        HomeViewModel.SpoofedTitleID = "0";
-                        break;
-                    }
-                    spoofingTime = stopwatch.Elapsed;
-                    SpoofingText = $"Spoofing {GameInfoResponse.Titles[0].Name} For: {spoofingTime.ToString(@"hh\:mm\:ss")}";
-                    i++;
+                    failures++;
+                    NotifySpoofProblem("Spoofing interrupted", result, failures);
                 }
-                Thread.Sleep(1000);
+
+                var healthy = result.Success;
+                var attempt = failures;
+                if (await WaitWhileSpoofingAsync(
+                        healthy ? SpoofRefreshInterval : SpoofRetryInterval,
+                        Stopped,
+                        () => SpoofingText = healthy
+                            ? $"Spoofing {titleName} For: {stopwatch.Elapsed:hh\\:mm\\:ss}"
+                            : $"Reconnecting {titleName} (attempt {attempt}) - {stopwatch.Elapsed:hh\\:mm\\:ss}"))
+                    break;
+
+                if (!HomeViewModel.IsSignedIn)
+                {
+                    result = SpoofResult.Fail("Waiting for the Xbox login to come back.");
+                    continue;
+                }
+
+                result = await SpoofSender.SendAsync(_singleSpoofApi.Value, HomeViewModel.XUIDOnly, titleId);
             }
         }
 
@@ -207,6 +284,8 @@ namespace XAU.ViewModels.Pages
         [ObservableProperty] private ObservableCollection<MultiSpoofGameItem> _multiSpoofGames = new();
         private bool _multiCurrentlySpoofing = false;
         private bool _multiSpoofingUpdate = false;
+        // Same role as _spoofSession: lets a superseded/stopped multi-spoof loop end itself.
+        private int _multiSpoofSession = 0;
         private Lazy<XboxRestAPI> _multiXboxRestAPI = new Lazy<XboxRestAPI>(() => new XboxRestAPI(() => HomeViewModel.XAUTH));
 
         // --- Multi-Spoof persistencia/historico (Documents\XAU) ---
@@ -227,14 +306,16 @@ namespace XAU.ViewModels.Pages
             if (_multiCurrentlySpoofing)
             {
                 _multiSpoofingUpdate = true;
+                _multiSpoofSession++;
                 _multiCurrentlySpoofing = false;
+                HomeViewModel.MultiSpoofingActive = false;
                 MultiSpoofingButtonText = "Start Multi-Spoof";
                 MultiSpoofingStatusText = "Multi-Spoofing Not Started";
                 await RecordMultiSpoofSessionEndAsync();
                 SaveMultiSpoofState(false, new List<string>());
                 System.Windows.Application.Current.Dispatcher.Invoke(() => MultiSpoofGames.Clear());
                 lock (_multiStateLock) _multiSessionStartMinutes.Clear();
-                await _multiXboxRestAPI.Value.StopHeartbeatAsync(HomeViewModel.XUIDOnly);
+                await GetSpoofApi().StopHeartbeatAsync(HomeViewModel.XUIDOnly);
                 return;
             }
 
@@ -267,6 +348,7 @@ namespace XAU.ViewModels.Pages
             var validIds = MultiSpoofGames.Select(g => g.TitleId).ToList();
             _multiCurrentlySpoofing = true;
             _multiSpoofingUpdate = false;
+            HomeViewModel.MultiSpoofingActive = true;
             _multiSessionStartedAtUtc = DateTime.UtcNow;
             MultiSpoofingButtonText = "Stop Multi-Spoof";
             MultiSpoofingStatusText = $"Multi-Spoofing {validIds.Count} title(s)";
@@ -274,7 +356,8 @@ namespace XAU.ViewModels.Pages
             SaveMultiSpoofState(true, validIds);
             ApplyLastSessionDeltas(); // mostra o delta da sessao anterior em cada jogo
 
-            _ = Task.Run(() => MultiSpoofingLoop(validIds));
+            var session = ++_multiSpoofSession;
+            _ = Task.Run(() => MultiSpoofingLoop(validIds, session));
         }
 
         private async Task LoadMultiSpoofGamesAsync(List<string> titleIds)
@@ -344,37 +427,78 @@ namespace XAU.ViewModels.Pages
             }
         }
 
-        private async Task MultiSpoofingLoop(List<string> titleIds)
+        // Keeps every selected title marked as playing, in parallel, until the user stops it.
+        // Each cycle sends presence for every title plus one heartbeat carrying the whole list, so all
+        // the games accrue playtime together (leave 5 games running for 10h -> 10h on each of them).
+        // The loop never ends on its own: rejected tokens and network errors are retried, which is
+        // what used to make the session die after ~8-10h.
+        private async Task MultiSpoofingLoop(List<string> titleIds, int session)
         {
             var stopwatch = Stopwatch.StartNew();
-            await _multiXboxRestAPI.Value.SendHeartbeatAsync(HomeViewModel.XUIDOnly, titleIds);
-            int i = 0;
-            _multiSpoofingUpdate = false;
-            Thread.Sleep(1000);
-            while (!_multiSpoofingUpdate)
+            var rotation = new List<string>(titleIds);
+            var failures = 0;
+            var parallel = false; // whether Xbox accepted the whole title list in one call
+            var lastDeltaUpdate = DateTime.UtcNow;
+            bool Stopped() => _multiSpoofingUpdate || session != _multiSpoofSession;
+
+            var result = await SpoofSender.SendAsync(_multiSpoofApi.Value, HomeViewModel.XUIDOnly, rotation);
+
+            while (!Stopped())
             {
-                if (i == 300)
+                if (result.Success)
                 {
-                    await _multiXboxRestAPI.Value.SendHeartbeatAsync(HomeViewModel.XUIDOnly, titleIds);
-                    await UpdateLiveDeltasAsync(titleIds);   // re-fetch playtime and show "+X min" live
-                    SaveMultiSpoofState(true, titleIds);     // heartbeat -> refresh lastSavedAtUtc
-                    i = 0;
+                    failures = 0;
+                    parallel = result.MultiTitleAccepted;
+
+                    // Move the head to the back so a different title is sent last each cycle. When the
+                    // whole list is accepted at once this changes nothing (they all stay active); when
+                    // it isn't, the playtime gets shared evenly between the games instead of always
+                    // landing on the same one.
+                    if (rotation.Count > 1)
+                    {
+                        var first = rotation[0];
+                        rotation.RemoveAt(0);
+                        rotation.Add(first);
+                    }
+
+                    SaveMultiSpoofState(true, titleIds); // heartbeat -> refresh lastSavedAtUtc
+
+                    if (DateTime.UtcNow - lastDeltaUpdate >= LiveDeltaInterval)
+                    {
+                        await UpdateLiveDeltasAsync(titleIds); // re-fetch playtime and show "+X min" live
+                        lastDeltaUpdate = DateTime.UtcNow;
+                    }
                 }
                 else
                 {
-                    if (_multiSpoofingUpdate) break;
-
-                    var elapsed = stopwatch.Elapsed.ToString(@"hh\:mm\:ss");
-                    System.Windows.Application.Current.Dispatcher.Invoke(() =>
-                    {
-                        foreach (var item in MultiSpoofGames)
-                        {
-                            item.SpoofingDuration = elapsed;
-                        }
-                    });
-                    i++;
+                    failures++;
+                    NotifySpoofProblem("Multi-Spoofing interrupted", result, failures);
                 }
-                Thread.Sleep(1000);
+
+                var healthy = result.Success;
+                var attempt = failures;
+                var mode = parallel ? "in parallel" : "alternating";
+                if (await WaitWhileSpoofingAsync(
+                        healthy ? SpoofRefreshInterval : SpoofRetryInterval,
+                        Stopped,
+                        () =>
+                        {
+                            var elapsed = stopwatch.Elapsed.ToString(@"hh\:mm\:ss");
+                            foreach (var item in MultiSpoofGames)
+                                item.SpoofingDuration = elapsed;
+                            MultiSpoofingStatusText = healthy
+                                ? $"Multi-Spoofing {rotation.Count} title(s) {mode} - {elapsed}"
+                                : $"Reconnecting {rotation.Count} title(s) (attempt {attempt}) - {elapsed}";
+                        }))
+                    break;
+
+                if (!HomeViewModel.IsSignedIn)
+                {
+                    result = SpoofResult.Fail("Waiting for the Xbox login to come back.");
+                    continue;
+                }
+
+                result = await SpoofSender.SendAsync(_multiSpoofApi.Value, HomeViewModel.XUIDOnly, rotation);
             }
         }
 

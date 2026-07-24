@@ -49,6 +49,11 @@ namespace XAU.ViewModels.Pages
         // AchievementResponse changes (user opens another game) during the long countdown.
         private string _autoUnlockServiceConfigId = "";
         private string _autoUnlockTitleAssocId = "";
+        // Snapshot of the title and its kind at start. The loop MUST use these (not the live
+        // IsEventBased/TitleIDOverride, which change as the user navigates) so it never switches
+        // code paths mid-session and unlocks a different game with stale identifiers.
+        private string _autoUnlockTitleId = "0";
+        private bool _autoUnlockIsEventBased = false;
 
         private static string AutoUnlockStatePath =>
             Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.MyDocuments), "XAU", "autounlock_state.json");
@@ -67,7 +72,21 @@ namespace XAU.ViewModels.Pages
         // that fire 60-120 min later (after a token refresh) don't 401 on a stale token.
         private Lazy<XboxRestAPI> _xboxRestAPI = new Lazy<XboxRestAPI>(() => new XboxRestAPI(() => HomeViewModel.XAUTH));
 
+        // Spoof/presence calls need the presence-capable token (SpoofXAUTH); reads keep using XAUTH.
+        private static XboxRestAPI GetSpoofApi() => new XboxRestAPI(() => XboxRestAPI.GetSpoofAuth());
+
+        // Cached client for the auto-spoof loop: the token is resolved per request, so it stays valid
+        // across renewals instead of creating a new HttpClient on every cycle.
+        private static readonly Lazy<XboxRestAPI> _spoofApi = new(() => new XboxRestAPI(() => XboxRestAPI.GetSpoofAuth()));
+
+        // Presence lasts 600s, so refresh every 150s; a failed cycle retries sooner.
+        private static readonly TimeSpan SpoofRefreshInterval = TimeSpan.FromSeconds(150);
+        private static readonly TimeSpan SpoofRetryInterval = TimeSpan.FromSeconds(45);
+
         public static bool SpoofingUpdate = false;
+        // Identifies the running auto-spoof session, so a loop that has been superseded (user opened
+        // another game) or stopped while a send was in flight ends itself instead of living forever.
+        private static int _autoSpoofSession = 0;
         private bool IsFiltered = false;
         private bool IsEventBased = false;
         private dynamic EventsData = (dynamic)(new JObject());
@@ -217,7 +236,14 @@ namespace XAU.ViewModels.Pages
                     GameName = GameInfoResponse.Titles[0].Name;
                 }
 
-                await Task.Run(() => Spoofing());
+                var session = ++_autoSpoofSession;
+                await Task.Run(() => Spoofing(session));
+
+                // A newer session (user opened another game) already owns the spoof state: don't let
+                // this one tear it down, or the new loop would find AutoSpoofedTitleID cleared.
+                if (session != _autoSpoofSession)
+                    return;
+
                 if (HomeViewModel.SpoofingStatus == 1)
                 {
                     if (HomeViewModel.SpoofedTitleID == HomeViewModel.AutoSpoofedTitleID)
@@ -237,29 +263,41 @@ namespace XAU.ViewModels.Pages
 
         }
 
-        public async Task Spoofing()
+        // Auto-spoofer keep-alive. Like the other spoof loops it retries instead of giving up: the
+        // presence token expires after a few hours and a failed cycle used to end the session
+        // silently, so the game stopped counting playtime until the user restarted it by hand.
+        public async Task Spoofing(int session)
         {
-            await _xboxRestAPI.Value.SendHeartbeatAsync(HomeViewModel.XUIDOnly, HomeViewModel.AutoSpoofedTitleID);
-            var i = 0;
-            Thread.Sleep(1000);
-            SpoofingUpdate = false;
-            while (!SpoofingUpdate)
-            {
-                if (i == 300)
-                {
-                    await _xboxRestAPI.Value.SendHeartbeatAsync(HomeViewModel.XUIDOnly, HomeViewModel.AutoSpoofedTitleID);
-                    i = 0;
-                }
-                else
-                {
-                    if (SpoofingUpdate)
-                    {
+            bool Stopped() => SpoofingUpdate || session != _autoSpoofSession;
 
-                        break;
-                    }
-                    i++;
+            var titleId = HomeViewModel.AutoSpoofedTitleID;
+            var result = await SpoofSender.SendAsync(_spoofApi.Value, HomeViewModel.XUIDOnly, titleId);
+            if (session != _autoSpoofSession) return;
+            SpoofingUpdate = false;
+
+            while (!Stopped())
+            {
+                var wait = result.Success ? SpoofRefreshInterval : SpoofRetryInterval;
+                var deadline = DateTime.UtcNow + wait;
+                while (DateTime.UtcNow < deadline)
+                {
+                    if (Stopped()) return;
+                    await Task.Delay(1000);
                 }
-                Thread.Sleep(1000);
+                if (Stopped()) return;
+
+                if (!HomeViewModel.IsSignedIn)
+                {
+                    result = SpoofResult.Fail("Waiting for the Xbox login to come back.");
+                    continue;
+                }
+
+                // The auto-spoofed title changes when the user opens another game's page.
+                titleId = HomeViewModel.AutoSpoofedTitleID;
+                if (string.IsNullOrWhiteSpace(titleId) || titleId == "0")
+                    return;
+
+                result = await SpoofSender.SendAsync(_spoofApi.Value, HomeViewModel.XUIDOnly, titleId);
             }
         }
 
@@ -737,6 +775,15 @@ namespace XAU.ViewModels.Pages
             DGAchievements.Clear();
             foreach (var a in sorted) DGAchievements.Add(a);
 
+            // Snapshot the title + kind so the background loop is pinned to THIS game regardless of
+            // any navigation the user does during the countdown.
+            _autoUnlockTitleId = TitleIDOverride;
+            _autoUnlockIsEventBased = IsEventBased;
+            // Reset captured title-based identifiers so a stale value from a previous (title-based)
+            // session can never be reused by a different game.
+            _autoUnlockServiceConfigId = "";
+            _autoUnlockTitleAssocId = "";
+
             // Capture the identifiers needed to unlock now, while AchievementResponse is valid.
             if (!IsEventBased && AchievementResponse?.achievements?.Any() == true
                 && AchievementResponse.achievements[0].titleAssociations?.Any() == true)
@@ -834,8 +881,17 @@ namespace XAU.ViewModels.Pages
 
             try
             {
-                if (IsEventBased)
+                // Use the snapshot taken at start, NOT the live IsEventBased (which flips as the user
+                // navigates) -- otherwise the loop could switch to the title-based path and reuse a
+                // stale serviceConfigId, unlocking a completely different game.
+                if (_autoUnlockIsEventBased)
                 {
+                    // Event-based unlocking needs the live page state (events data / request body), so
+                    // it can only run while the captured game is still the one on screen. If the user
+                    // navigated away, skip rather than risk unlocking the wrong (currently shown) game.
+                    if (TitleIDOverride != _autoUnlockTitleId)
+                        return false;
+
                     var tcs = new TaskCompletionSource<bool>();
                     System.Windows.Application.Current.Dispatcher.Invoke(() =>
                     {

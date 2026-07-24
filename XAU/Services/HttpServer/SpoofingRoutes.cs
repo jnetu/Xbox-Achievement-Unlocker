@@ -50,8 +50,15 @@ public static class SpoofingRoutes
                 return;
             }
 
-            var xboxRestAPI = getXboxRestAPI();
-            await xboxRestAPI.SendHeartbeatAsync(xuid, titleId);
+            // Presence spoofing needs the presence-capable token (SpoofXAUTH), not the read token.
+            var xboxRestAPI = new XboxRestAPI(() => XboxRestAPI.GetSpoofAuth());
+            var spoofResult = await xboxRestAPI.SendSpoofAsync(xuid, titleId);
+            if (!spoofResult.Success)
+            {
+                response.StatusCode = 400;
+                await SendJsonResponse(response, new { error = spoofResult.Error ?? "Spoof request failed." });
+                return;
+            }
 
             response.StatusCode = 200;
             await SendJsonResponse(response, new { message = "Spoofing started successfully.", titleId });

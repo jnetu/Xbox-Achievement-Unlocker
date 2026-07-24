@@ -1,5 +1,7 @@
 // TODO: Clean up, set names, default fields, minor renames, etc.
 
+using Newtonsoft.Json;
+
 public class GameTitleRequest
 {
     public string? Pfns { get; set; }
@@ -46,6 +48,38 @@ public class TitleRequest
     public string? id { get; set; }
     public string state { get; set; } = "active";
     public string sandbox { get; set; } = "RETAIL";
+}
+
+// Body for the newer userpresence endpoint (single title).
+public class PresenceTitleRequest
+{
+    [JsonProperty("id")]
+    public ulong id { get; set; }
+
+    public string state { get; set; } = "active";
+    public string placement { get; set; } = "full";
+}
+
+// Result of a spoof attempt, so callers can surface the exact API error (e.g. 403).
+public readonly struct SpoofResult
+{
+    public bool Success { get; init; }
+    public string? Error { get; init; }
+
+    // The API rejected the token (401/403). The caller renews the presence token and retries instead
+    // of killing the session -- this is what happens once the spoof token ages out mid-session.
+    public bool AuthRejected { get; init; }
+
+    // Every requested title was registered in a single call (multi-title heartbeat accepted), so all
+    // of them stay "active" at the same time. When false the caller rotates the title order so the
+    // playtime is at least spread evenly instead of piling up on one game.
+    public bool MultiTitleAccepted { get; init; }
+
+    public static SpoofResult Ok(bool multiTitleAccepted = false) =>
+        new() { Success = true, MultiTitleAccepted = multiTitleAccepted };
+
+    public static SpoofResult Fail(string error, bool authRejected = false) =>
+        new() { Success = false, Error = error, AuthRejected = authRejected };
 }
 
 public class GamepassProductsRequest
