@@ -757,14 +757,41 @@ namespace XAU.ViewModels.Pages
 
         private static readonly string EventsLogPath = Path.Combine(
             Environment.GetFolderPath(Environment.SpecialFolder.MyDocuments), "XAU", "events_debug.log");
+        // Off by default: the ETW capture loop logs several lines per second, so leaving this on
+        // unattended is what made events_debug.log grow without bound. Read straight off Settings
+        // (toggled from the Settings page) so there is no second copy of the flag to keep in sync --
+        // SaveSettings swaps the whole Settings object out from under us.
+        private const int MaxDebugLogLines = 20000;
+
+        // Counted in memory instead of re-reading the file on every write -- at 20k lines a
+        // File.ReadAllLines per log line would dominate the cost of logging itself.
+        private static int _debugLogLines = -1;
+        private static readonly object EventsLogLock = new();
 
         public static void EventsLog(string msg)
         {
+            if (!Settings.DebugLoggingEnabled) return;
+
             var line = $"[{DateTime.Now:HH:mm:ss}] {msg}";
             try
             {
-                Directory.CreateDirectory(Path.GetDirectoryName(EventsLogPath)!);
-                File.AppendAllText(EventsLogPath, line + Environment.NewLine);
+                lock (EventsLogLock)
+                {
+                    Directory.CreateDirectory(Path.GetDirectoryName(EventsLogPath)!);
+
+                    // First write of the session: adopt whatever is already on disk.
+                    if (_debugLogLines < 0)
+                        _debugLogLines = File.Exists(EventsLogPath) ? File.ReadAllLines(EventsLogPath).Length : 0;
+
+                    if (_debugLogLines >= MaxDebugLogLines)
+                    {
+                        File.Delete(EventsLogPath);
+                        _debugLogLines = 0;
+                    }
+
+                    File.AppendAllText(EventsLogPath, line + Environment.NewLine);
+                    _debugLogLines++;
+                }
             }
             catch { }
         }
@@ -832,20 +859,39 @@ namespace XAU.ViewModels.Pages
                     else
                         EventsLog("Token missing/invalid, refreshing...");
 
-                    // Keep capturing until we get a token or settings change
-                    while (Settings.AutoGrabEventsToken && IsLoggedIn)
+                    // Go through Solitaire rather than calling EtwTokenCapture.Capture() directly.
+                    // The events token is only on the wire while a game is sending telemetry to
+                    // OneCollector, so a bare capture on an otherwise idle machine scans a ~250MB
+                    // ETL and finds nothing -- forever, at 5s intervals. Launching Solitaire is what
+                    // the manual button does, and it is the only thing that makes the token appear.
+                    int attempt = 0;
+                    while (Settings.AutoGrabEventsToken && IsLoggedIn && !IsEventsTokenValid())
                     {
-                        var token = EtwTokenCapture.Capture(20);
-                        if (!string.IsNullOrEmpty(token))
+                        // Don't run two captures at once: both would fight over the same ETW
+                        // session name and ETL path, and each would kill the other's trace.
+                        if (ManualScanRunning)
                         {
-                            AchievementsViewModel.EventsToken = token;
-                            _eventsTokenObtainedAt = DateTime.UtcNow;
+                            Thread.Sleep(5000);
+                            continue;
+                        }
+
+                        attempt++;
+                        eventsTokenFound = false;
+                        GrabEventsTokenFromSolitaire();
+
+                        if (IsEventsTokenValid())
+                        {
                             PersistEventsToken();
-                            EventsLog("ETW capture success.");
+                            EventsLog($"ETW capture success on attempt {attempt}.");
                             break;
                         }
-                        EventsLog("ETW capture found no token, retrying in 5s...");
-                        Thread.Sleep(5000);
+
+                        // Back off instead of hammering. This runs unattended for days, and every
+                        // attempt rewrites a large ETL -- retrying every 5s burns the disk for
+                        // nothing when the capture is failing for a reason waiting won't fix.
+                        var backoff = TimeSpan.FromMinutes(Math.Min(30, 2 * attempt));
+                        EventsLog($"Attempt {attempt} found no token, retrying in {backoff.TotalMinutes:F0}m...");
+                        Thread.Sleep(backoff);
                     }
                 }
 
@@ -1632,6 +1678,7 @@ namespace XAU.ViewModels.Pages
             Settings.EventsUserHash = settings.EventsUserHash;
             Settings.AutoTokenRefreshEnabled = settings.AutoTokenRefreshEnabled;
             Settings.SessionKeepAliveEnabled = settings.SessionKeepAliveEnabled;
+            Settings.DebugLoggingEnabled = settings.DebugLoggingEnabled;
             _eventsUserHash = settings.EventsUserHash;
 
             // Restore cached events token if it's still fresh

@@ -30,6 +30,7 @@ namespace XAU.ViewModels.Pages
         [ObservableProperty] private bool _autoGrabEventsToken;
         [ObservableProperty] private bool _autoTokenRefreshEnabled;
         [ObservableProperty] private bool _sessionKeepAliveEnabled;
+        [ObservableProperty] private bool _debugLoggingEnabled;
         [ObservableProperty] private string _xauth;
 
         [ObservableProperty] private bool _serverEnabled;
@@ -60,7 +61,14 @@ namespace XAU.ViewModels.Pages
                 OAuthLogin = OAuthLogin,
                 AutoGrabEventsToken = AutoGrabEventsToken,
                 AutoTokenRefreshEnabled = AutoTokenRefreshEnabled,
-                SessionKeepAliveEnabled = SessionKeepAliveEnabled
+                SessionKeepAliveEnabled = SessionKeepAliveEnabled,
+                DebugLoggingEnabled = DebugLoggingEnabled,
+                // Carried over explicitly: these are owned by the events-token worker, not by this
+                // page. Rebuilding XAUSettings from the page's fields alone would blank them on
+                // every toggle, throwing away a valid cached token and forcing a fresh scan.
+                CachedEventsToken = HomeViewModel.Settings.CachedEventsToken,
+                EventsTokenObtainedAt = HomeViewModel.Settings.EventsTokenObtainedAt,
+                EventsUserHash = HomeViewModel.Settings.EventsUserHash
             };
             string settingsJson = JsonConvert.SerializeObject(settings);
             File.WriteAllText(SettingsFilePath, settingsJson);
@@ -205,6 +213,7 @@ namespace XAU.ViewModels.Pages
             AutoGrabEventsToken = HomeViewModel.Settings.AutoGrabEventsToken;
             AutoTokenRefreshEnabled = HomeViewModel.Settings.AutoTokenRefreshEnabled;
             SessionKeepAliveEnabled = HomeViewModel.Settings.SessionKeepAliveEnabled;
+            DebugLoggingEnabled = HomeViewModel.Settings.DebugLoggingEnabled;
         }
 
         private string GetAssemblyVersion()
