@@ -17,4 +17,5 @@ public class XAUSettings
     public string? EventsUserHash { get; set; }
     public bool AutoTokenRefreshEnabled { get; set; }
     public bool SessionKeepAliveEnabled { get; set; }
+    public bool DebugLoggingEnabled { get; set; }
 }

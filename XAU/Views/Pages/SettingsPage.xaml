@@ -366,6 +366,29 @@
                 </ui:Anchor>
             </StackPanel>
         </ui:CardExpander>
+        <ui:CardControl Margin="4,2">
+            <ui:CardControl.Header>
+                <Grid>
+                    <Grid.RowDefinitions>
+                        <RowDefinition Height="Auto" />
+                        <RowDefinition Height="Auto" />
+                    </Grid.RowDefinitions>
+                    <ui:TextBlock
+                        Grid.Row="0"
+                        FontTypography="Body"
+                        Text="Debug Logging"
+                        TextWrapping="WrapWithOverflow" />
+                    <ui:TextBlock
+                        Grid.Row="1"
+                        Foreground="{ui:ThemeResource TextFillColorSecondaryBrush}"
+                        Text="Writes events_debug.log to the XAU folder for bug reports. Off by default; the file is wiped once it passes 20,000 lines."
+                        TextWrapping="WrapWithOverflow" />
+                </Grid>
+            </ui:CardControl.Header>
+            <ui:ToggleSwitch
+                Command="{Binding ViewModel.SaveSettingsCommand}"
+                IsChecked="{Binding ViewModel.DebugLoggingEnabled, Mode=TwoWay}" />
+        </ui:CardControl>
         <ui:CardExpander Margin="4,2">
             <ui:CardExpander.Header>
                 <Grid>
